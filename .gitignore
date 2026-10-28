@@ -5,3 +5,4 @@ cf/src/agent-image.wasm
 cf/src/harness.txt
 cf/.wrangler/
 .wrangler/
+embed/pi-bundle.js
