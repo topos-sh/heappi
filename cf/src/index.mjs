@@ -32,6 +32,7 @@ export class AgentCell extends DurableObject {
     this.completions = new Map(); // gateway cache, content keyed
     this.CHUNK = 1024 * 1024; // under the 2 MB blob limit of DO SQLite
     this.FOLD_MIN = 64 * 1024;
+    this.CADENCE_MS = 500; // replication batches at most twice a second
   }
   ensureSchema() {
     this.sql.exec(`
@@ -127,18 +128,20 @@ export class AgentCell extends DurableObject {
   async replicate(seq, kind, bytes, epoch) {
     this.repQueue ??= [];
     this.repQueue.push({ seq, kind, bytes, epoch });
-    if (this.repDraining) return this.repDraining;
     const t0 = Date.now();
+    if (this.syncReplication) { await this.drainReplication(); return Date.now() - t0; }
+    // time-bound cadence: the first queued checkpoint starts a timer; everything
+    // queued before it fires goes out in one batch
+    this.repTimer ??= new Promise((res) => setTimeout(res, this.CADENCE_MS)).then(() => { this.repTimer = null; return this.drainReplication(); });
+    return this.repTimer;
+  }
+  async drainReplication() {
+    if (this.repDraining) return this.repDraining;
     this.repDraining = (async () => {
-      try {
-        while (this.repQueue.length) {
-          const batch = this.repQueue.splice(0);
-          await this.replicateBatch(batch);
-        }
-      } finally { this.repDraining = null; }
+      try { while (this.repQueue.length) await this.replicateBatch(this.repQueue.splice(0)); }
+      finally { this.repDraining = null; }
     })();
-    await this.repDraining;
-    return Date.now() - t0;
+    return this.repDraining;
   }
   async replicateBatch(batch) {
     const prefix = `agents/${this.agentId}/`;
@@ -167,9 +170,10 @@ export class AgentCell extends DurableObject {
     const epoch = 1;
     this.sql.exec("UPDATE head SET epoch = ?, head_seq = 1, base_seq = 1 WHERE k = 1", epoch);
     this.putCheckpoint(1, "base", bytes);
+    this.syncReplication = true;
     const r2Ms = await this.replicate(1, "base", bytes, epoch);
     this.engine = engine;
-    return { baseBytes: bytes.length, r2Ms, colo: this.colo ?? null };
+    return { baseBytes: bytes.length, r2Ms };
   }
 
   async load(tier) {
@@ -228,6 +232,7 @@ export class AgentCell extends DurableObject {
     let r2Ms = -1;
     if (this.syncReplication) r2Ms = await this.replicate(seq, kind, bytes, epoch);
     else this.ctx.waitUntil(this.pendingReplication = this.replicate(seq, kind, bytes, epoch).catch((e) => console.log("replication failed", e)));
+    if (!this.syncReplication) r2Ms = -1;
     const tEnd = Date.now();
     return { rec: { ...loaded, events: events.length, runMs, kind, checkpointBytes: bytes.length, snapshotMs: tCommit - tSnap, commitMs: tRep - tCommit, r2Ms, totalMs: tEnd - tRun, linearBytes: engine.linearBytes, heapUsed: engine.mem().memory_used }, calls, replies };
   }

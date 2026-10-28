@@ -20,7 +20,7 @@ async function call(path) {
 }
 
 console.log(`== ${args.label}: ${base}, agent ${args.agent}, ${TURNS} turns`);
-const noops = []; let colo; for (let i = 0; i < 5; i++) { const n = await call("/noop"); noops.push(n.clientMs); colo = n.colo; }
+const noops = []; let colo; for (let i = 0; i < 9; i++) { const n = await call("/noop"); noops.push(n.clientMs); colo = n.colo; }
 const rtt = median(noops);
 console.log(`  round trip (noop): ${rtt.toFixed(1)} ms, colo ${colo}, replication ${args.rep}`);
 const created = await call("/create");
