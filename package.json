@@ -1,0 +1,19 @@
+{
+  "name": "agent-image",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Prototype and benchmarks of the agent image architecture: one heap per agent on the dquickts-chain engine",
+  "scripts": {
+    "build:engine": "./engine/build.sh",
+    "smoke": "node --no-warnings host/smoke.mjs",
+    "demo": "node --no-warnings host/demo.mjs 3",
+    "bench": "node --no-warnings bench/run.mjs"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-durable": "1.4.0",
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-codemode": "1.4.0",
+    "@earendil-works/chord": "1.4.0"
+  }
+}

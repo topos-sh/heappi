@@ -1,0 +1,25 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { openPi, runPiAgent, closePi, piFileBytes } from "./pi.mjs";
+import { expectedCount } from "../host/scenario.mjs";
+import { inspectSqlite } from "../bench/inspect-sqlite.mjs";
+
+const dir = mkdtempSync(join(tmpdir(), "pi-base-"));
+console.log("dir", dir);
+const pi = await openPi(join(dir, "pi.sqlite"));
+const turns = Number(process.argv[2] ?? 3);
+const t0 = performance.now();
+const { conversation } = await runPiAgent(pi, "root", turns);
+console.log(`${turns} turns in`, (performance.now() - t0).toFixed(0), "ms");
+const page = await conversation.entries({ order: "ascending" }, 1000, undefined, BACKGROUND_CONTEXT);
+const answers = page.items.filter((e) => e.kind === "pi.assistant").map((e) => e.model?.[0]?.content?.filter((c) => c.type === "text").map((c) => c.text).join("") ?? "");
+let ok = 0;
+answers.forEach((a, i) => { if (a.includes(`has ${expectedCount(Math.floor(i / 2) + 1)} records`)) ok++; });
+console.log("entries", page.items.length, "kinds", [...new Set(page.items.map((e) => e.kind))].join(","), "final answers correct:", ok, "of", turns, "sample:", answers.filter(Boolean).slice(-1)[0]);
+console.log("sqlite bytes (file+wal)", piFileBytes(pi), "faux calls", pi.faux.state.callCount);
+await closePi(pi);
+const r = inspectSqlite(join(dir, "pi.sqlite"));
+console.log("file after checkpoint", r.file);
+for (const t of r.tables.slice(0, 8)) console.log("  ", t.table.padEnd(30), String(t.rows).padStart(6), String(t.bytes).padStart(9));
