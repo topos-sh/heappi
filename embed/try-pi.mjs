@@ -1,4 +1,4 @@
-// Can Pi Durable run inside the agent-image heap? Evaluate the bundle in
+// Can Pi Durable run inside the heappi heap? Evaluate the bundle in
 // the engine, open a Harness on MemoryStorage with the faux model and one
 // tool, run turns, snapshot, restore in a fresh instance, continue.
 import { readFileSync } from "node:fs";

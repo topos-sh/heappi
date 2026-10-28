@@ -6,7 +6,7 @@
 // The broker (scripted model, fetch tool) runs inside the object so a turn
 // is deterministic; every host call still parks, commits and resumes.
 import { DurableObject } from "cloudflare:workers";
-import engineModule from "./agent-image.wasm";
+import engineModule from "./heappi.wasm";
 import HARNESS_SRC from "./harness.txt";
 import { Engine, SNAPSHOT_BASE, SNAPSHOT_CHAIN } from "../../host/engine.mjs";
 import { fetchSource, scriptedModel, userMessage, expectedCount } from "../../host/scenario.mjs";

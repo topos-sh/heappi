@@ -8,7 +8,7 @@ import { Cell } from "./cell.mjs";
 import { Broker } from "./broker.mjs";
 import { userMessage, expectedCount } from "./scenario.mjs";
 
-const dir = mkdtempSync(join(tmpdir(), "agent-image-"));
+const dir = mkdtempSync(join(tmpdir(), "heappi-"));
 const store = new Store(join(dir, "cells.sqlite"), join(dir, "cold"));
 const broker = new Broker();
 const cell = new Cell(store, broker, { foldMinBytes: 16 * 1024 });

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Build the engine (dquickts-chain, branch chained-checkpoints) plus the host
-# shim as a wasm32-wasi reactor module: engine/agent-image.wasm
+# shim as a wasm32-wasi reactor module: engine/heappi.wasm
 #
 #   ENGINE=../dquickts-chain WASI_SDK=/path/to/wasi-sdk ./engine/build.sh
 set -e
@@ -15,5 +15,5 @@ SRCS="$ENGINE/quickjs.c $ENGINE/dtoa.c $ENGINE/libregexp.c $ENGINE/libunicode.c 
   -I"$ENGINE" \
   -Wl,--initial-memory=2097152 -Wl,--max-memory=1073741824 -Wl,-z,stack-size=1048576 \
   -Wl,--export=malloc -Wl,--export=free \
-  -o agent-image.wasm $SRCS
-ls -la agent-image.wasm
+  -o heappi.wasm $SRCS
+ls -la heappi.wasm

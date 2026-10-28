@@ -1,4 +1,4 @@
-// Wrapper over engine/agent-image.wasm (a wasm32-wasi reactor), runtime
+// Wrapper over engine/heappi.wasm (a wasm32-wasi reactor), runtime
 // agnostic: give it an instantiated module. One Engine = one instance = one
 // heap. Node loading lives in engine-node.mjs; Workers use cf/src/wasi.mjs.
 

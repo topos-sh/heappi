@@ -1,11 +1,11 @@
-# Using agent-image
+# Using heappi
 
 How to run the prototype, what its interfaces are, and how the pieces fit. The [README](README.md) has the design summary and the benchmark results; this file is the operator's and integrator's view.
 
 ## 1. Prerequisites and quick start
 
 - Node 24 (uses `node:sqlite`; `node:wasi` is not needed).
-- Nothing else to run what is committed: the engine binary `engine/agent-image.wasm` is in the repo.
+- Nothing else to run what is committed: the engine binary `engine/heappi.wasm` is in the repo.
 - To rebuild the engine: a wasi-sdk (25 was used) and the engine fork at `../dquickts-chain`.
 - To run the Cloudflare cell: `wrangler` 4 (fetched by `npx`), a Cloudflare account with an R2 bucket named in `cf/wrangler.jsonc`.
 

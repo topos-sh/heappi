@@ -1,7 +1,7 @@
 node_modules/
 *.sqlite
 *.sqlite-*
-cf/src/agent-image.wasm
+cf/src/heappi.wasm
 cf/src/harness.txt
 cf/.wrangler/
 .wrangler/

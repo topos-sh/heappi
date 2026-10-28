@@ -10,7 +10,7 @@ import { Cell, HARNESS_PATH } from "./cell.mjs";
 import { Broker } from "./broker.mjs";
 import { userMessage, expectedCount } from "./scenario.mjs";
 
-const dir = mkdtempSync(join(tmpdir(), "agent-image-tests-"));
+const dir = mkdtempSync(join(tmpdir(), "heappi-tests-"));
 let n = 0;
 const ok = (name) => console.log(`ok ${++n} ${name}`);
 

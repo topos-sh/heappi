@@ -29,7 +29,7 @@ const { values: args } = parseArgs({ options: {
   "skip-pi": { type: "boolean", default: false },
 } });
 const TURNS = Number(args.turns), AGENTS = Number(args.agents), ITEMS = Number(args.items), MEM_AGENTS = Number(args["mem-agents"]);
-const work = mkdtempSync(join(tmpdir(), "agent-image-bench-"));
+const work = mkdtempSync(join(tmpdir(), "heappi-bench-"));
 const results = { params: { turns: TURNS, agents: AGENTS, items: ITEMS, memAgents: MEM_AGENTS, node: process.version, platform: process.platform, arch: process.arch, date: new Date().toISOString() } };
 const kb = (b) => (b / 1024).toFixed(1);
 const median = (xs) => { const s = [...xs].sort((a, b) => a - b); return s.length ? s[Math.floor(s.length / 2)] : NaN; };
