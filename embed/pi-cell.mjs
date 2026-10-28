@@ -11,7 +11,7 @@ import { userMessage, expectedCount } from "../host/scenario.mjs";
 const turns = Number(process.argv[2] ?? 6);
 const dir = mkdtempSync(join(tmpdir(), "pi-cell-"));
 const store = new Store(join(dir, "cells.sqlite"), join(dir, "cold"));
-const cell = new Cell(store, new Broker(), { harnessSrc: readFileSync(new URL("./pi-harness.js", import.meta.url), "utf8"), foldMinBytes: 64 * 1024, foldEvery: Number(process.argv[3] ?? 64) });
+const cell = new Cell(store, new Broker(), { harnessSrc: readFileSync(new URL("./pi-harness.js", import.meta.url), "utf8"), foldMinBytes: 64 * 1024, foldEvery: Number(process.argv[3] ?? 64), gcBeforeSnapshot: process.argv.includes("--gc") });
 const id = "pi-1";
 const t0 = performance.now();
 const created = await cell.create(id);

@@ -28,6 +28,7 @@ export class Cell {
     this.memoryLimit = opts.memoryLimit ?? 64 * 1024 * 1024;
     this.harnessSrc = opts.harnessSrc ?? readFileSync(HARNESS_PATH, "utf8");
     this.checkRebuild = opts.checkRebuild ?? true;
+    this.gcBeforeSnapshot = opts.gcBeforeSnapshot ?? false; // collect cycles so garbage never enters a checkpoint
     this.hot = new Map();      // agentId → { engine, epoch, lastApplyMs }
     this.layers = null;        // [engineHash, harnessHash] for the current harness
     this.metrics = [];
@@ -135,6 +136,7 @@ export class Cell {
     const slow = (this.hot.get(agentId)?.lastApplyMs ?? 0) > this.foldMaxApplyMs;
     const kind = shape.deltas + 1 >= this.foldEvery || shape.deltaBytes >= Math.max(shape.baseBytes, this.foldMinBytes) || slow ? "base" : "chain";
     const tSnap = performance.now();
+    if (this.gcBeforeSnapshot) engine.gc();
     const bytes = engine.snapshot(kind === "base" ? SNAPSHOT_BASE : SNAPSHOT_CHAIN);
     const snapshotMs = performance.now() - tSnap;
     const mem = engine.mem();
