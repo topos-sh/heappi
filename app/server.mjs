@@ -15,10 +15,12 @@ import { connectMcp } from "./mcp.mjs";
 import { fetchSource } from "../host/scenario.mjs";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
+// secrets and settings from heappi/.env (never committed); the shell environment wins
+try { const before = { ...process.env }; process.loadEnvFile(join(here, "..", ".env")); for (const k of Object.keys(before)) process.env[k] = before[k]; } catch {}
 const DEMO = process.argv.includes("--demo");
 const PORT = Number(process.env.PORT ?? 8788);
 if (!DEMO && !process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_OAUTH_TOKEN) {
-  console.error("Set ANTHROPIC_API_KEY (or run with --demo for the scripted model).");
+  console.error("No model key. Put ANTHROPIC_API_KEY=sk-ant-... in heappi/.env (see .env.example), or run with --demo for the scripted model.");
   process.exit(1);
 }
 
