@@ -82,6 +82,13 @@ export class Cell {
     return { engine, tier: forceTier === "cold" ? "cold" : "warm", restoreMs: now - t0, readMs: tRead - t0, instantiateMs: tInst - tRead, applyMs: now - tInst, chainLength: chain.length, chainBytes: chain.base.length + chain.deltas.reduce((s, d) => s + d.length, 0) };
   }
 
+  /** a harness that schedules with timers defines __pump; run it until nothing fires */
+  static quiesce(engine) {
+    if (engine.hasPump === undefined) engine.hasPump = (engine.eval("typeof __pump") && engine.result()) === "function";
+    if (!engine.hasPump) return;
+    for (let i = 0; i < 10000; i++) { const n = Number(engine.call("__pump").result ?? 0); engine.run(); if (!n) return; }
+  }
+
   /** run the heap over the events and collect the outbox */
   #runEvents(engine, events) {
     const journal = [];
@@ -89,6 +96,7 @@ export class Cell {
       if (ev.type === "result") journal.push({ kind: "event", data: { type: "result", id: ev.id, error: ev.error, hash: ev.error ? undefined : this.store.intern(ev.value ?? null) } });
       else journal.push({ kind: "event", data: ev });
       engine.call("__deliver", JSON.stringify(ev));
+      Cell.quiesce(engine);
     }
     const out = JSON.parse(engine.call("__drain").result ?? "[]");
     return { journal, out };
@@ -167,7 +175,7 @@ export class Cell {
       if (j.kind === "upgrade") { scratch.eval(j.data.src, "harness.js"); scratch.call("__migrate"); continue; }
       if (j.kind !== "event") continue;
       const ev = j.data.type === "result" ? { type: "result", id: j.data.id, error: j.data.error, value: j.data.error ? undefined : this.store.body(j.data.hash) } : j.data;
-      scratch.call("__deliver", JSON.stringify(ev)); scratch.call("__drain"); events++;
+      scratch.call("__deliver", JSON.stringify(ev)); Cell.quiesce(scratch); scratch.call("__drain"); events++;
     }
     const rebuilt = scratch.call("__stateHash").result, live = liveEngine.call("__stateHash").result;
     scratch.drop();

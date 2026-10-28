@@ -6,3 +6,4 @@ cf/src/harness.txt
 cf/.wrangler/
 .wrangler/
 embed/pi-bundle.js
+embed/pi-harness.js
