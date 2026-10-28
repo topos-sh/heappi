@@ -49,7 +49,7 @@ row("---", "---", "---");
 row("Image, parked", "0", "storage only");
 row("Image, hot (wasm instance restored)", `${kb(mem.image.rssPerAgent)} RSS`, `wasm linear memory ${kb(mem.image.linearBytes)}, engine heap used ${kb(mem.image.heapUsed)}; ${ms(mem.image.instantiateAndRestoreMs)} to instantiate and restore`);
 row("Same harness in a V8 context (node:vm)", `${kb(mem.v8vm.jsHeapPerAgent)} V8 heap`, "contexts share one isolate; a real isolate (workerd, Dynamic Workers) adds its own heap and code space");
-if (pi) row("Pi Durable, conversation settled, harness open", `${kb(pi.residentPerConversationWhileOpen)} RSS`, "one harness per SQLite file in this run; Pi keeps little per idle conversation, the harness itself dominates");
+if (pi) row("Pi Durable, one harness per conversation, open and idle", `${kb(pi.residentPerConversationWhileOpen)} RSS`, "the harness process state dominates (TypeBox, pi-ai, the QuickJS sandbox); many conversations share one harness in practice, so this is not a per-conversation cost");
 row("Infinity (claimed)", "~100 KB", "from its in-memory benchmark, not measured here");
 lines.push("");
 lines.push("### Model context");
