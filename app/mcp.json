@@ -1,0 +1,6 @@
+{
+  "servers": {
+    "fs": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem@2.1.0", "./app/workspace"] },
+    "memory": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-memory@2.0.1"], "env": { "MEMORY_FILE_PATH": "./app/workspace/memory.jsonl" } }
+  }
+}

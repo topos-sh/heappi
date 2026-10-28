@@ -4,6 +4,7 @@
 // can run activation after activation deterministically.
 import { createHash } from "node:crypto";
 import { fetchSource, scriptedModel } from "./scenario.mjs";
+import { transcriptToSimple, simpleToAssistant } from "./pi-shape.mjs";
 
 export class Broker {
   constructor({ items } = {}) {
@@ -19,7 +20,8 @@ export class Broker {
         const key = createHash("sha256").update(JSON.stringify(args)).digest("base64url");
         if (this.completions.has(key)) { this.cacheHits++; return this.completions.get(key); }
         this.modelCalls++;
-        const c = scriptedModel(args);
+        // the small harness sends { messages, tools }; the Pi harness sends { context: { messages, ... } }
+        const c = args.context ? simpleToAssistant(scriptedModel({ messages: transcriptToSimple(args.context.messages), tools: [] })) : scriptedModel(args);
         this.completions.set(key, c);
         return c;
       }

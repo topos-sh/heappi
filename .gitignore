@@ -7,3 +7,6 @@ cf/.wrangler/
 .wrangler/
 embed/pi-bundle.js
 embed/pi-harness.js
+app/data/
+app/workspace/*
+!app/workspace/README.md

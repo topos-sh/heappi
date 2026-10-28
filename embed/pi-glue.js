@@ -1,29 +1,34 @@
 // Pi Durable as the harness inside the heap. Evaluated after prelude.js
-// and pi-bundle.js (globalThis.PI). Implements the same host contract as
+// and pi-bundle.js (globalThis.PI). Implements the host contract of
 // heap/harness.js: __deliver, __drain, __pump, __stats, __stateHash,
 // __migrate, __peek.
 //
-// How the joins work:
+// The joins:
 // - model: pi-ai's faux provider with an async response factory; the
-//   factory awaits hostCall("model", ...) and converts both ways.
-// - tools: Pi tools whose execute() awaits hostCall("tool", ...); large
-//   results become handles in working memory, as in harness.js.
-// - code mode: a `run` tool that compiles the script in a script context
-//   through the same string-only bridge as harness.js.
+//   factory sends the transcript as a pi-ai Context through hostCall and
+//   returns the assistant message the gateway produced.
+// - tools: a catalog delivered by a `config` event (MCP tools from the
+//   host, the built-in fetch) becomes Pi tools whose execute() awaits
+//   hostCall("tool", ...); large results become handles. `run` compiles a
+//   script in a script context through the string-only bridge.
 // - storage: Pi's MemoryStorage lives in the heap and is what the
 //   checkpoint carries; every committed entry is mirrored into the outbox
-//   as a `pi.entry` record, which the cell journals (the readable shadow).
+//   as a `pi.entry` record (the readable shadow). Tool starts and ends go
+//   out as `progress` records for a UI.
+// - signals: a `signal` event is submitted to Pi as user input tagged
+//   with its name, so the agent reacts to external events between turns.
 "use strict";
 (() => {
-  const HARNESS_VERSION = 100; // Pi-based harness line
+  const HARNESS_VERSION = 101;
   const POOL = 2;
   const HANDLE_THRESHOLD = 1024;
-  const { BACKGROUND_CONTEXT, createModels, fauxProvider, fauxAssistantMessage, fauxToolCall, Type, createRegistry, defineExtension, defineTool, Harness, MemoryStorage } = PI;
+  const { BACKGROUND_CONTEXT, createModels, fauxProvider, Type, createRegistry, defineExtension, defineTool, Harness, MemoryStorage } = PI;
 
   const S = globalThis.__agent ??= {
     version: HARNESS_VERSION, pending: new Map(), outbox: [], callSeq: 0,
     memory: new Map(), handleSeq: 0, turn: 0, modelCalls: 0, toolCalls: 0, scripts: 0,
     mirrored: 0, lastEntryId: null, poolReady: false, harness: null, root: null,
+    config: { tools: [], instructions: "", model: { provider: "faux", modelId: "faux-1" } },
   };
 
   // ---- host calls ----
@@ -34,6 +39,7 @@
       S.outbox.push({ kind: "call", id, name, args });
     });
   }
+  const progress = (event, data) => S.outbox.push({ kind: "progress", event, ...data });
 
   // ---- working memory (handles) ----
   function digest(v) {
@@ -44,23 +50,29 @@
   }
   function keep(value, origin) { const handle = "$r" + (++S.handleSeq); S.memory.set(handle, { value, origin }); return { handle, digest: digest(value), origin }; }
 
-  // ---- the model: pi-ai messages → gateway shape → pi-ai assistant message ----
-  function toGateway(messages) {
-    const out = [];
+  // ---- the model: the transcript goes out as a pi-ai Context ----
+  function transcriptToContext(messages) {
+    let systemPrompt = "";
+    const tools = new Map();
+    const rest = [];
     for (const m of messages) {
-      if (m.role === "user") out.push({ role: "user", content: typeof m.content === "string" ? m.content : m.content.map((c) => c.text ?? "").join("") });
-      else if (m.role === "assistant") out.push({ role: "assistant", content: m.content.filter((c) => c.type === "text").map((c) => c.text).join(""), tool_calls: m.content.filter((c) => c.type === "toolCall").map((c) => ({ id: c.id, name: c.name, args: c.arguments })) });
-      else if (m.role === "toolResult") out.push({ role: "tool", tool_call_id: m.toolCallId, content: (m.content.find((c) => c.type === "text")?.text ?? "") });
+      if (m.role !== "system") { rest.push(m); continue; }
+      const text = typeof m.content === "string" ? m.content : (m.content ?? []).map((c) => c.text ?? "").join("");
+      const sections = m.sections ? Object.values(m.sections).filter(Boolean).join("\n") : "";
+      if (text || sections) systemPrompt = [systemPrompt, text, sections].filter(Boolean).join("\n\n");
+      for (const t of m.toolsRemoved ?? []) tools.delete(typeof t === "string" ? t : t.name);
+      for (const t of m.toolsAdded ?? []) tools.set(t.name, { name: t.name, description: t.description, parameters: t.parameters });
     }
-    return out;
+    return { systemPrompt, messages: rest, tools: [...tools.values()] };
   }
   const faux = fauxProvider();
-  const factory = async (ctx) => {
-    faux.appendResponses([factory]); // keep the queue fed
+  const factory = async (ctx, options) => {
+    faux.appendResponses([factory]);
     S.modelCalls++;
-    const r = await hostCall("model", { messages: toGateway(ctx.messages), tools: ["fetch", "run"] });
-    if (r.tool_calls && r.tool_calls.length) return fauxAssistantMessage(r.tool_calls.map((tc) => fauxToolCall(tc.name, tc.args, { id: tc.id })), { stopReason: "toolUse" });
-    return fauxAssistantMessage(r.content ?? "");
+    progress("model_call", { n: S.modelCalls });
+    const r = await hostCall("model", { context: transcriptToContext(ctx.messages), options: { maxTokens: options?.maxTokens, toolChoice: options?.toolChoice } });
+    if (!r || r.role !== "assistant") throw new Error("gateway returned no assistant message");
+    return r;
   };
   faux.setResponses([factory, factory]);
   const models = createModels(); models.setProvider(faux.provider);
@@ -84,15 +96,15 @@
     for (let i = 1; i <= POOL; i++) { __evalIn(i, PRELUDE); settlers[i] = __evalIn(i, "__settle"); }
     S.poolReady = true;
   }
-  const HOST_TOOLS = { fetch: (args) => hostCall("tool", { name: "fetch", args }) };
+  const hostTool = (name, args) => hostCall("tool", { name, args });
   globalThis.__scriptCall = (ctx, op, json) => {
     const p = JSON.parse(json);
     switch (op) {
       case "tool": {
         if (p.name === "run") throw new Error("scripts cannot start scripts");
-        if (!HOST_TOOLS[p.name]) throw new Error("no tool " + p.name);
+        if (!S.config.tools.some((t) => t.name === p.name) && p.name !== "fetch") throw new Error("no tool " + p.name);
         S.toolCalls++;
-        HOST_TOOLS[p.name](p.args).then((v) => settlers[ctx](p.id, true, JSON.stringify(v ?? null)), (e) => settlers[ctx](p.id, false, String(e && e.message || e)));
+        hostTool(p.name, p.args).then((v) => settlers[ctx](p.id, true, JSON.stringify(v ?? null)), (e) => settlers[ctx](p.id, false, String(e && e.message || e)));
         return String(p.id);
       }
       case "mem": return JSON.stringify(S.memory.get(p.handle)?.value ?? null);
@@ -109,46 +121,51 @@
     return JSON.parse(JSON.stringify(value ?? null));
   }
 
-  // ---- Pi tools: execute() is a host call or a script ----
+  // ---- Pi tools from the catalog ----
   function asResult(out, origin) {
     const json = JSON.stringify(out);
     const text = json !== undefined && json.length > HANDLE_THRESHOLD ? JSON.stringify(keep(out, origin)) : (json ?? "undefined");
     return { output: [{ type: "text", text }] };
   }
-  const fetchTool = defineTool({ name: "fetch", description: "Fetch a source", parameters: Type.Object({ source: Type.Number() }), replay: "safe",
-    execute: async (args) => { S.toolCalls++; return asResult(await HOST_TOOLS.fetch(args), "fetch"); } });
-  const runTool = defineTool({ name: "run", description: "Run JavaScript against the tools and working memory", parameters: Type.Object({ code: Type.String() }), replay: "safe",
-    execute: async (args) => asResult(await runScript(args.code), "run") });
-  const registry = createRegistry();
-  registry.install(defineExtension({ name: "image", tools: [fetchTool, runTool] }));
+  function buildRegistry() {
+    const tools = [];
+    for (const t of S.config.tools) {
+      tools.push(defineTool({ name: t.name, description: t.description ?? t.name, parameters: Type.Unsafe(t.inputSchema ?? { type: "object", properties: {} }), replay: "safe",
+        execute: async (args) => { S.toolCalls++; progress("tool_start", { name: t.name, args }); try { const v = await hostTool(t.name, args); progress("tool_end", { name: t.name, ok: true }); return asResult(v, t.name); } catch (e) { progress("tool_end", { name: t.name, ok: false, error: String(e?.message ?? e) }); throw e; } } }));
+    }
+    tools.push(defineTool({ name: "run", description: "Run JavaScript. `tools.<name>(args)` calls any tool, `mem[handle]` reads working memory, `remember(value, label)` keeps a value and returns its handle, `log(...)` prints. Return a small value; keep large data with remember.", parameters: Type.Object({ code: Type.String() }), replay: "safe",
+      execute: async (args) => { progress("tool_start", { name: "run", args: { code: args.code.slice(0, 200) } }); try { const v = await runScript(args.code); progress("tool_end", { name: "run", ok: true }); return asResult(v, "run"); } catch (e) { progress("tool_end", { name: "run", ok: false, error: String(e?.message ?? e) }); throw e; } } }));
+    const registry = createRegistry();
+    registry.install(defineExtension({ name: "heappi", tools }));
+    return registry;
+  }
 
   // ---- Pi harness on in-heap storage; entries mirrored to the journal ----
   const settings = { progress: { partialIntervalMs: 0, outputIntervalMs: 0 } };
   async function open() {
     if (S.root) return S.root;
-    S.harness = await Harness.open(new MemoryStorage(), { models, registry, settings, onReport: (r) => S.outbox.push({ kind: "pi.report", text: String(r?.stack ?? r).slice(0, 500) }) }, BACKGROUND_CONTEXT);
-    S.root = await S.harness.root(BACKGROUND_CONTEXT, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
+    S.harness = await Harness.open(new MemoryStorage(), { models, registry: buildRegistry(), settings, onReport: (r) => S.outbox.push({ kind: "pi.report", text: String(r?.stack ?? r).slice(0, 500) }) }, BACKGROUND_CONTEXT);
+    S.root = await S.harness.root(BACKGROUND_CONTEXT, { agent: { model: { provider: "faux", modelId: "faux-1" }, instructions: S.config.instructions || undefined } });
     return S.root;
   }
   async function mirror(root) {
-    // append committed entries newer than the last mirrored one to the outbox
-    const page = await root.entries({ order: "ascending", ...(S.lastEntryId ? { minEntryId: S.lastEntryId } : {}) }, 200, undefined, BACKGROUND_CONTEXT);
+    const page = await root.entries({ order: "ascending", ...(S.lastEntryId ? { minEntryId: S.lastEntryId } : {}) }, 500, undefined, BACKGROUND_CONTEXT);
     for (const e of page.items) {
       if (e.id === S.lastEntryId) continue;
       S.outbox.push({ kind: "pi.entry", id: e.id, entry: e.kind, model: e.model ?? null, data: e.data ?? null });
       S.lastEntryId = e.id; S.mirrored++;
     }
   }
-  async function handleUser(text) {
+  async function submit(text) {
     S.turn++;
     const root = await open();
-    const sub = await root.submit({ type: "input", content: text }, BACKGROUND_CONTEXT);
+    const sub = await root.submit({ type: "input", content: text, whenBusy: "followUp" }, BACKGROUND_CONTEXT);
     const settled = await sub.wait(BACKGROUND_CONTEXT);
     await mirror(root);
     const page = await root.entries({ order: "descending" }, 2, undefined, BACKGROUND_CONTEXT);
     const a = page.items.find((x) => x.kind === "pi.assistant");
     const reply = a?.model?.[0]?.content?.filter((c) => c.type === "text").map((c) => c.text).join("") ?? "";
-    S.outbox.push({ kind: "reply", turn: S.turn, text: settled.status === "done" ? reply : `unanswered: ${JSON.stringify(settled).slice(0, 200)}` });
+    S.outbox.push({ kind: "reply", turn: S.turn, text: settled.status === "done" ? reply : `unanswered: ${JSON.stringify(settled).slice(0, 300)}` });
   }
 
   // ---- host contract ----
@@ -156,19 +173,20 @@
     const ev = JSON.parse(json);
     switch (ev.type) {
       case "result": { const p = S.pending.get(ev.id); if (!p) { S.outbox.push({ kind: "late_result", id: ev.id }); return; } S.pending.delete(ev.id); ev.error ? p.reject(new Error(ev.error)) : p.resolve(ev.value); return; }
-      case "user": handleUser(ev.text).catch((e) => S.outbox.push({ kind: "error", error: String(e && e.stack || e) })); return;
+      case "config": S.config = { ...S.config, ...ev.config }; if (S.root) S.outbox.push({ kind: "error", error: "config after open is not applied until the next harness upgrade" }); return;
+      case "user": submit(ev.text).catch((e) => S.outbox.push({ kind: "error", error: String(e && e.stack || e) })); return;
+      case "signal": submit(`[signal:${ev.name}] ${typeof ev.payload === "string" ? ev.payload : JSON.stringify(ev.payload ?? null)}`).catch((e) => S.outbox.push({ kind: "error", error: String(e && e.stack || e) })); return;
       default: S.outbox.push({ kind: "error", error: "unknown event " + ev.type });
     }
   };
-  globalThis.__pump = () => __runTimers(); // Pi schedules with setTimeout; the host pumps until quiet
+  globalThis.__pump = () => __runTimers();
   globalThis.__drain = () => { const s = JSON.stringify(S.outbox); S.outbox.length = 0; return s; };
-  globalThis.__stats = () => JSON.stringify({ version: S.version, turn: S.turn, handles: S.memory.size, pending: S.pending.size, modelCalls: S.modelCalls, toolCalls: S.toolCalls, scripts: S.scripts, mirrored: S.mirrored, harness: "pi-durable" });
+  globalThis.__stats = () => JSON.stringify({ version: S.version, turn: S.turn, handles: S.memory.size, pending: S.pending.size, modelCalls: S.modelCalls, toolCalls: S.toolCalls, scripts: S.scripts, mirrored: S.mirrored, tools: S.config.tools.length, harness: "pi-durable" });
   globalThis.__peek = (handle) => JSON.stringify(S.memory.get(handle)?.value ?? null);
   function fnv(str) { let h = 0x811c9dc5; for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return h.toString(16).padStart(8, "0"); }
-  // content-only hash: Pi's ids and timestamps differ between a live heap and a rebuilt one
   globalThis.__stateHash = () => {
     const handles = [...S.memory.entries()].map(([k, v]) => [k, v.origin, fnv(JSON.stringify(v.value))]);
-    return fnv(JSON.stringify({ turn: S.turn, handles, entries: S.mirrored, callSeq: S.callSeq, lastKinds: S.__lastKinds ?? null }));
+    return fnv(JSON.stringify({ turn: S.turn, handles, entries: S.mirrored, callSeq: S.callSeq }));
   };
   globalThis.__migrate = () => { const from = S.version; S.version = HARNESS_VERSION; return JSON.stringify({ from, to: HARNESS_VERSION }); };
 })();

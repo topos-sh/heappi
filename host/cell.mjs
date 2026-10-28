@@ -120,10 +120,14 @@ export class Cell {
     const outbox = [], replies = [];
     for (const o of out) {
       if (o.kind === "call") {
-        const data = o.name === "model" ? { id: o.id, name: o.name, messages: o.args.messages.map((m) => this.store.intern(m)), tools: o.args.tools } : { id: o.id, name: o.name, args: o.args };
+        const msgs = o.args.messages ?? o.args.context?.messages ?? [];
+        const data = o.name === "model"
+          ? { id: o.id, name: o.name, messages: msgs.map((m) => this.store.intern(m)), tools: o.args.tools ?? o.args.context?.tools?.map((t) => t.name), systemPrompt: o.args.context?.systemPrompt ? this.store.intern(o.args.context.systemPrompt) : undefined }
+          : { id: o.id, name: o.name, args: o.args };
         journal.push({ kind: "call", data }); outbox.push(o);
       } else if (o.kind === "reply") replies.push(o);
       else journal.push({ kind: o.kind, data: o });
+      this.onOutbox?.(agentId, o);
     }
 
     // the writer folds: when the deltas outweigh the base, after foldEvery deltas, or when the last restore was slow

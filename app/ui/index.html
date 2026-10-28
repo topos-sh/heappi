@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>heappi</title>
+<style>
+:root{--bg:#f6f7f8;--surface:#fff;--fg:#1b2026;--muted:#5b6670;--line:#d9dee3;--accent:#0b6e6a;--tint:#e3f1ef;--warn:#9a5b00;--warn-bg:#fbf1e0;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
+@media (prefers-color-scheme:dark){:root{--bg:#14181c;--surface:#1c2227;--fg:#e6eaed;--muted:#9aa5ae;--line:#2e373e;--accent:#5cc8c0;--tint:#1a2c2b;--warn:#e2a74a;--warn-bg:#2a2214}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;height:100vh;display:grid;grid-template-columns:220px 1fr 300px;grid-template-rows:100vh}
+@media (max-width:900px){body{grid-template-columns:1fr;grid-template-rows:auto 1fr auto;height:auto}}
+aside,section{min-width:0}
+aside{border-right:1px solid var(--line);padding:14px;overflow:auto;background:var(--surface)}
+aside h1{font-size:18px;margin:0 0 10px}
+aside button{display:block;width:100%;text-align:left;padding:7px 9px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);cursor:pointer;margin-bottom:6px;font:inherit;font-size:13px}
+aside button[aria-current=true]{border-color:var(--accent);background:var(--tint)}
+main{display:flex;flex-direction:column;min-height:0}
+#log{flex:1;overflow:auto;padding:18px 20px}
+.msg{max-width:72ch;margin:0 0 12px;padding:10px 14px;border-radius:10px;white-space:pre-wrap;word-wrap:break-word}
+.user{background:var(--tint);margin-left:auto}
+.assistant{background:var(--surface);border:1px solid var(--line)}
+.tool{font-family:var(--mono);font-size:12px;color:var(--muted);border-left:2px solid var(--line);padding:4px 10px;margin:0 0 10px}
+.signal{background:var(--warn-bg);border:1px solid var(--warn);font-size:13px}
+.error{color:var(--warn);font-family:var(--mono);font-size:12px}
+.sys{color:var(--muted);font-size:12px;margin:0 0 8px}
+form.send{display:flex;gap:8px;padding:12px 20px;border-top:1px solid var(--line);background:var(--surface)}
+textarea,input{font:inherit;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);width:100%}
+textarea{resize:none;height:44px}
+button.primary{font:inherit;padding:8px 14px;border:0;border-radius:6px;background:var(--accent);color:#fff;cursor:pointer}
+.right{border-left:1px solid var(--line);padding:14px;overflow:auto;background:var(--surface);font-size:13px}
+.right h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:14px 0 6px;font-family:var(--mono);font-weight:500}
+.right dl{margin:0;display:grid;grid-template-columns:auto 1fr;gap:3px 10px}
+.right dt{color:var(--muted)}.right dd{margin:0;font-family:var(--mono);font-size:12px}
+.right form{display:grid;gap:6px}
+.right button{font:inherit;font-size:13px;padding:6px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);cursor:pointer}
+.stream{opacity:.85}
+</style>
+</head>
+<body>
+<aside>
+  <h1>heappi</h1>
+  <div id="agents"></div>
+  <button id="new">+ new agent</button>
+  <p class="sys" id="model"></p>
+</aside>
+<main>
+  <div id="log"><p class="sys">pick or create an agent</p></div>
+  <form class="send" id="send"><textarea id="text" placeholder="message the agent… (Enter to send, Shift+Enter for a new line)"></textarea><button class="primary" type="submit">Send</button></form>
+</main>
+<section class="right">
+  <h2>External signal</h2>
+  <form id="signal"><input id="sname" placeholder="name, e.g. order.paid"><input id="spayload" placeholder='payload JSON, e.g. {"id": 42}'><input id="safter" placeholder="after ms (optional timer)"><button type="submit">Send signal</button></form>
+  <h2>Agent</h2>
+  <dl id="stats"></dl>
+  <button id="evict" style="margin-top:8px">Evict hot copy (next event restores warm)</button>
+  <h2>Last activations</h2>
+  <div id="acts" style="font-family:var(--mono);font-size:11.5px;color:var(--muted)"></div>
+  <h2>Tools</h2>
+  <div id="tools" style="font-family:var(--mono);font-size:11.5px;color:var(--muted)"></div>
+</section>
+<script>
+const $ = (id) => document.getElementById(id);
+let current = null, es = null, streaming = null, lastStreamed = "";
+const api = (path, opts) => fetch("/api/agents" + path, opts).then((r) => r.json());
+function el(cls, text) { const d = document.createElement("div"); d.className = cls; d.textContent = text; $("log").appendChild(d); $("log").scrollTop = $("log").scrollHeight; return d; }
+function renderMessage(m) {
+  if (!m) return;
+  if (m.role === "user") { const t = typeof m.content === "string" ? m.content : m.content.map((c) => c.text ?? "").join(""); el(t.startsWith("[signal:") ? "msg signal" : "msg user", t); }
+  else if (m.role === "assistant") { const text = m.content.filter((c) => c.type === "text").map((c) => c.text).join(""); if (text) el("msg assistant", text); for (const c of m.content.filter((c) => c.type === "toolCall")) el("tool", `→ ${c.name}(${JSON.stringify(c.arguments).slice(0, 300)})`); }
+  else if (m.role === "toolResult") el("tool", `← ${m.toolName}: ${m.content.map((c) => c.text ?? "").join("").slice(0, 400)}`);
+}
+async function refreshAgents() {
+  const r = await api("");
+  $("model").textContent = (r.demo ? "demo model" : r.model) + " · " + r.tools.length + " tools";
+  $("tools").textContent = r.tools.join("\n");
+  $("agents").innerHTML = "";
+  for (const id of r.agents) { const b = document.createElement("button"); b.textContent = id; b.setAttribute("aria-current", String(id === current)); b.onclick = () => select(id); $("agents").appendChild(b); }
+}
+async function refreshStats() {
+  if (!current) return;
+  const r = await api("/" + current + "/info");
+  const s = r.stats; const z = r.sizes;
+  $("stats").innerHTML = Object.entries({ harness: s.harness + " v" + s.version, turn: s.turn, "model calls": s.modelCalls, "tool calls": s.toolCalls, handles: s.handles, hot: r.hot ? "yes" : "no (parked)", "live chain": (z.chainLive / 1024).toFixed(0) + " KB", journal: (z.journal / 1024).toFixed(0) + " KB", "journal rows": r.journalRows }).map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
+}
+function select(id) {
+  current = id; $("log").innerHTML = ""; streaming = null;
+  es?.close();
+  es = new EventSource("/api/agents/" + id + "/events");
+  es.onmessage = (e) => {
+    const ev = JSON.parse(e.data);
+    if (ev.type === "hello") { for (const t of ev.transcript) renderMessage(t.model); refreshStats(); }
+    else if (ev.type === "model_start") { streaming = el("msg assistant stream", ""); }
+    else if (ev.type === "text_delta") { streaming ??= el("msg assistant stream", ""); streaming.textContent += ev.delta; $("log").scrollTop = $("log").scrollHeight; }
+    else if (ev.type === "model_done" || ev.type === "model_cached") { if (streaming) { streaming.classList.remove("stream"); lastStreamed = streaming.textContent; } streaming = null; }
+    else if (ev.type === "progress") { if (ev.event === "tool_start") el("tool", `→ ${ev.name}(${JSON.stringify(ev.args ?? {}).slice(0, 300)})`); else if (ev.event === "tool_end") el("tool", `← ${ev.name} ${ev.ok ? "ok" : "failed: " + ev.error}`); }
+    else if (ev.type === "reply") { if (streaming) { streaming.classList.remove("stream"); streaming = null; } else if (ev.text && ev.text !== lastStreamed) el("msg assistant", ev.text); lastStreamed = ""; refreshStats(); }
+    else if (ev.type === "activation") { const a = $("acts"); a.textContent = `${ev.tier} ${ev.kind} ${(ev.checkpointBytes / 1024).toFixed(1)} KB restore ${ev.restoreMs.toFixed(1)} ms run ${ev.runMs.toFixed(1)} ms heap ${(ev.heapUsed / 1024).toFixed(0)} KB\n` + a.textContent.split("\n").slice(0, 7).join("\n"); }
+    else if (ev.type === "error" || ev.type === "pi.report") el("error", ev.error ?? ev.text);
+  };
+  refreshAgents(); refreshStats();
+}
+$("new").onclick = async () => { const r = await api("", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }); await refreshAgents(); select(r.id); };
+$("send").onsubmit = async (e) => { e.preventDefault(); const text = $("text").value.trim(); if (!text || !current) return; $("text").value = ""; el("msg user", text); await api("/" + current + "/messages", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text }) }); };
+$("text").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("send").requestSubmit(); } });
+$("signal").onsubmit = async (e) => { e.preventDefault(); if (!current) return; let payload = $("spayload").value; try { payload = JSON.parse(payload); } catch {} const afterMs = Number($("safter").value) || 0; await api("/" + current + "/signals", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: $("sname").value || "ping", payload, afterMs }) }); el("sys", afterMs ? `signal scheduled in ${afterMs} ms` : "signal sent"); };
+$("evict").onclick = async () => { if (!current) return; await api("/" + current + "/evict", { method: "POST" }); el("sys", "hot copy evicted; the next event restores from SQLite"); refreshStats(); };
+refreshAgents();
+</script>
+</body>
+</html>

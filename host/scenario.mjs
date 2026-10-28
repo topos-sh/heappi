@@ -56,7 +56,9 @@ export function scriptedModel(req) {
   const msgs = req.messages;
   const last = msgs[msgs.length - 1];
   if (last.role === "user") {
-    const t = Number(/source (\d+)/.exec(last.content)[1]);
+    const m = /source (\d+)/.exec(last.content);
+    if (!m) return { content: `(demo model) noted: ${String(last.content).slice(0, 80)}`, tool_calls: [] };
+    const t = Number(m[1]);
     return { content: "", tool_calls: [{ id: `call_${t}`, name: "run", args: { code: scriptFor(t) } }] };
   }
   if (last.role === "tool") {
