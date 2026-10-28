@@ -13,7 +13,7 @@ SRCS="$ENGINE/quickjs.c $ENGINE/dtoa.c $ENGINE/libregexp.c $ENGINE/libunicode.c 
 "$CC" --target=wasm32-wasi -O2 -flto -mexec-model=reactor \
   -D_GNU_SOURCE -DCONFIG_VERSION="\"$VERSION\"" -funsigned-char -fwrapv \
   -I"$ENGINE" \
-  -Wl,--initial-memory=2097152 -Wl,--max-memory=1073741824 -Wl,-z,stack-size=1048576 \
+  -Wl,--import-memory -Wl,--initial-memory=2097152 -Wl,--max-memory=1073741824 -Wl,-z,stack-size=1048576 \
   -Wl,--export=malloc -Wl,--export=free \
   -o heappi.wasm $SRCS
 ls -la heappi.wasm

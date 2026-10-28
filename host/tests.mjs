@@ -164,4 +164,25 @@ async function ask(cell, store, id, text) {
   store.close();
 }
 
+// ---- 7. restores clone a template and apply the agent's checkpoints; a full restore agrees ----
+{
+  const store = new Store(join(dir, "template.sqlite"), null);
+  const cell = new Cell(store, new Broker(), { checkRebuild: false });
+  await cell.create("h");
+  for (let t = 1; t <= 3; t++) await ask(cell, store, "h", userMessage(t));
+  const live = await cell.stateHash("h");
+  cell.evictHot("h");
+  store.enqueue("h", { type: "user", text: userMessage(4) });
+  const recs = await cell.drain("h");
+  assert.equal(recs[0].how, "template");
+  assert.equal(recs.flatMap((r) => r.replies)[0].text, `Source 4 has ${expectedCount(4)} records scoring above 50.`);
+  const full = new Cell(store, new Broker(), { checkRebuild: false, useTemplates: false });
+  const viaFull = await full.stateHash("h");
+  const viaTemplate = await cell.stateHash("h");
+  assert.equal(viaFull, viaTemplate);
+  assert.notEqual(viaTemplate, live);
+  ok(`a warm restore clones the template and applies the checkpoints (${recs[0].restoreMs.toFixed(1)} ms); a full restore agrees`);
+  store.close();
+}
+
 console.log(`\n${n} checks passed`);

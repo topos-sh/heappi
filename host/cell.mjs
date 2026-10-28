@@ -31,6 +31,8 @@ export class Cell {
     this.gcBeforeSnapshot = opts.gcBeforeSnapshot ?? false; // collect cycles so garbage never enters a checkpoint
     this.hot = new Map();      // agentId → { engine, epoch, lastApplyMs }
     this.layers = null;        // [engineHash, harnessHash] for the current harness
+    this.templates = new Map(); // harnessHash → an idle instance holding the layers, cloned per restore
+    this.useTemplates = opts.useTemplates ?? true;
     this.metrics = [];
     this.rebuilds = [];
   }
@@ -63,6 +65,17 @@ export class Cell {
 
   async #fresh() { const e = await Engine.create(); e.setMemoryLimit(this.memoryLimit); return e; }
 
+  /** an instance that restored the layers once; every restore starts from a copy of its memory */
+  async #template(layers) {
+    let t = this.templates.get(layers[1]);
+    if (!t) {
+      t = await this.#fresh();
+      t.restore(this.store.getLayer(layers[0]), [this.store.getLayer(layers[1])], { anchorAfter: 0 });
+      this.templates.set(layers[1], t);
+    }
+    return t;
+  }
+
   evictHot(agentId) {
     const h = this.hot.get(agentId);
     if (h) { h.engine.drop(); this.hot.delete(agentId); }
@@ -75,12 +88,24 @@ export class Cell {
     if (h) this.evictHot(agentId);
     const chain = forceTier === "cold" ? this.store.coldChain(agentId) : this.store.chain(agentId);
     const tRead = performance.now();
-    const engine = await this.#fresh();
-    const tInst = performance.now();
-    engine.restore(chain.base, chain.deltas, { anchorAfter: chain.anchorAfter ?? -1 });
+    let engine, tInst, how = "full";
+    if (this.useTemplates && chain.anchorAfter === 0) {
+      // clone the template that holds the layers, then apply only the agent's own checkpoints
+      const template = await this.#template(this.store.layersOf(agentId));
+      engine = template.clone();
+      engine.setMemoryLimit(this.memoryLimit);
+      tInst = performance.now();
+      try { engine.apply(chain.deltas.slice(1)); how = "template"; }
+      catch (e) { engine.drop(); engine = null; this.applyFailures = (this.applyFailures ?? 0) + 1; this.lastApplyError = String(e.message ?? e); }
+    }
+    if (!engine) {
+      engine = await this.#fresh();
+      tInst = performance.now();
+      engine.restore(chain.base, chain.deltas, { anchorAfter: chain.anchorAfter ?? -1 });
+    }
     const now = performance.now();
     this.hot.set(agentId, { engine, epoch, lastApplyMs: now - tInst });
-    return { engine, tier: forceTier === "cold" ? "cold" : "warm", restoreMs: now - t0, readMs: tRead - t0, instantiateMs: tInst - tRead, applyMs: now - tInst, chainLength: chain.length, chainBytes: chain.base.length + chain.deltas.reduce((s, d) => s + d.length, 0) };
+    return { engine, tier: forceTier === "cold" ? "cold" : "warm", how, restoreMs: now - t0, readMs: tRead - t0, instantiateMs: tInst - tRead, applyMs: now - tInst, chainLength: chain.length, chainBytes: chain.base.length + chain.deltas.reduce((s, d) => s + d.length, 0) };
   }
 
   /** a harness that schedules with timers defines __pump; run it until nothing fires */
@@ -160,7 +185,7 @@ export class Cell {
     }
     if (engine.linearBytes > this.hotMaxLinear) this.evictHot(agentId); // bloat: the next activation restores warm
 
-    const rec = { agentId, events: events.length, tier: loaded.tier, restoreMs: loaded.restoreMs, readMs: loaded.readMs, instantiateMs: loaded.instantiateMs, applyMs: loaded.applyMs, chainLength: loaded.chainLength, chainBytes: loaded.chainBytes, runMs, kind, checkpointBytes: bytes.length, snapshotMs, commitMs, calls: outbox.length, replies, heapUsed: mem.memory_used, objects: mem.obj_count, linearBytes: engine.linearBytes, rebuild, evicted: !this.hot.has(agentId) };
+    const rec = { agentId, events: events.length, tier: loaded.tier, how: loaded.how, restoreMs: loaded.restoreMs, readMs: loaded.readMs, instantiateMs: loaded.instantiateMs, applyMs: loaded.applyMs, chainLength: loaded.chainLength, chainBytes: loaded.chainBytes, runMs, kind, checkpointBytes: bytes.length, snapshotMs, commitMs, calls: outbox.length, replies, heapUsed: mem.memory_used, objects: mem.obj_count, linearBytes: engine.linearBytes, rebuild, evicted: !this.hot.has(agentId) };
     this.metrics.push(rec);
     return rec;
   }

@@ -220,6 +220,8 @@ EXPORT("ai_set_budget_ms") void ai_set_budget_ms(double ms) { budget_ms = ms; }
 EXPORT("ai_set_budget_ticks") void ai_set_budget_ticks(long n) { budget_ticks = n; }
 EXPORT("ai_set_memory_limit") void ai_set_memory_limit(size_t n) { memory_limit = n; if (rt) JS_SetMemoryLimit(rt, n); }
 EXPORT("ai_context_count") int ai_context_count(void) { return ctx_count; }
+extern int js_snapshot_debug;
+EXPORT("ai_set_debug") void ai_set_debug(int on) { js_snapshot_debug = on; }
 
 /* fresh runtime: the harness context plus `script_pool` script contexts */
 EXPORT("ai_init") int ai_init(void) {
@@ -301,6 +303,18 @@ EXPORT("ai_restore") int ai_restore(const uint8_t *base, size_t base_len,
     ctx_count = res.context_count < MAX_CTX ? res.context_count : MAX_CTX;
     for (int i = 0; i < ctx_count; i++) ctxs[i] = res.contexts[i];
     ctx = ctxs[0];
+    JS_FreeSnapshotResult(rt, &res);
+    return 0;
+}
+
+/* apply n chained checkpoints to the live runtime (which holds the base
+   they continue); 0 on success, -1 with the runtime unusable */
+EXPORT("ai_apply") int ai_apply(const uint8_t *const *deltas, const size_t *lens, int n) {
+    JSSnapshotResult res;
+    int rc = JS_ApplySnapshotChain(rt, deltas, lens, n, &host, &res, errbuf, sizeof errbuf);
+    if (rc) return -1;
+    for (int i = 0; i < res.context_count; i++) JS_FreeContext(res.contexts[i]);
+    for (int i = 0; i < res.root_count; i++) JS_FreeValueRT(rt, res.roots[i]);
     JS_FreeSnapshotResult(rt, &res);
     return 0;
 }

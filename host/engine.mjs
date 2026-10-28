@@ -33,12 +33,32 @@ function nowNs() { return (typeof performance !== "undefined" ? performance.time
 
 export class Engine {
   /** instantiate synchronously from a compiled module (Workers, or Node after compile) */
-  static fromModule(mod, log) {
+  static fromModule(mod, log, { memory, initialize = true } = {}) {
     let inst;
-    const imports = wasiImports(() => inst.exports.memory, log);
+    const mem = memory ?? new WebAssembly.Memory({ initial: 32, maximum: 16384 });
+    const imports = { env: { memory: mem }, ...wasiImports(() => mem, log) };
     inst = new WebAssembly.Instance(mod, imports);
-    inst.exports._initialize();
-    return new Engine(inst);
+    if (initialize) inst.exports._initialize();
+    const e = new Engine(inst);
+    e.mod = mod; e.log = log; e.mem_ = mem;
+    return e;
+  }
+  /**
+   * A new instance whose linear memory starts as a copy of this one's: a
+   * template that restored the shared layers is cloned per agent, and the
+   * clone applies only the agent's own checkpoints. The template must be
+   * idle (no JS running) and is never used for anything else.
+   */
+  clone() {
+    const src = this.mem_.buffer;
+    const pages = src.byteLength >> 16;
+    const mem = new WebAssembly.Memory({ initial: pages, maximum: 16384 });
+    // instantiate first: the module's data segments are written into the
+    // memory at instantiation, and the copy must come after them
+    const e = Engine.fromModule(this.mod, this.log, { memory: mem, initialize: false });
+    new Uint8Array(mem.buffer).set(new Uint8Array(src));
+    e.live = true;
+    return e;
   }
 
   constructor(inst) {
@@ -47,11 +67,11 @@ export class Engine {
     this.live = false;
   }
 
-  get memory() { return this.x.memory; }
+  get memory() { return this.mem_; }
   /** bytes of wasm linear memory currently reserved by this instance */
-  get linearBytes() { return this.x.memory.buffer.byteLength; }
+  get linearBytes() { return this.mem_.buffer.byteLength; }
 
-  #u8() { return new Uint8Array(this.x.memory.buffer); }
+  #u8() { return new Uint8Array(this.mem_.buffer); }
 
   #putString(s) {
     const bytes = enc.encode(s);
@@ -138,7 +158,7 @@ export class Engine {
     const ptrs = deltas.map((d) => this.#putBytes(d));
     const arr = this.x.ai_malloc(4 * Math.max(n, 1));
     const lens = this.x.ai_malloc(4 * Math.max(n, 1));
-    const dv = new DataView(this.x.memory.buffer);
+    const dv = new DataView(this.mem_.buffer);
     for (let i = 0; i < n; i++) {
       dv.setUint32(arr + 4 * i, ptrs[i], true);
       dv.setUint32(lens + 4 * i, deltas[i].length, true);
@@ -150,6 +170,18 @@ export class Engine {
     this.live = true;
   }
 
+  /** apply chained checkpoints to the live runtime, which holds the base they continue */
+  apply(deltas) {
+    const n = deltas.length;
+    if (!n) return;
+    const ptrs = deltas.map((d) => this.#putBytes(d));
+    const arr = this.x.ai_malloc(4 * n), lens = this.x.ai_malloc(4 * n);
+    const dv = new DataView(this.mem_.buffer);
+    for (let i = 0; i < n; i++) { dv.setUint32(arr + 4 * i, ptrs[i], true); dv.setUint32(lens + 4 * i, deltas[i].length, true); }
+    const rc = this.x.ai_apply(arr, lens, n);
+    ptrs.forEach((p) => this.x.ai_free(p)); this.x.ai_free(arr); this.x.ai_free(lens);
+    if (rc !== 0) { this.live = false; throw new Error(`apply: ${this.error()}`); }
+  }
   baseId() { this.x.ai_base_id(); return this.result(); }
   setAnchor() { if (this.x.ai_set_anchor() !== 0) throw new Error(`anchor: ${this.error()}`); }
   anchorId() { this.x.ai_anchor_id(); return this.result(); }
