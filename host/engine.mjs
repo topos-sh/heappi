@@ -80,7 +80,7 @@ export class Engine {
   }
   #status(rc, what) {
     if (rc < 0) throw new Error(`${what}: ${this.error()}`);
-    return rc === 1 ? "suspended" : "done";
+    return rc === 1 ? "suspended" : rc === 2 ? "terminated" : "done";
   }
 
   init() {
@@ -91,6 +91,8 @@ export class Engine {
 
   setBudgetMs(ms) { this.x.ai_set_budget_ms(ms); }
   setBudgetTicks(n) { this.x.ai_set_budget_ticks(n); }
+  setMemoryLimit(bytes) { this.x.ai_set_memory_limit(bytes); }
+  contextCount() { return this.x.ai_context_count(); }
   ticks() { return this.x.ai_ticks(); }
 
   /** evaluate a script in the global scope; returns "done" | "suspended" */

@@ -47,7 +47,8 @@ async function benchImage() {
   let baseBytes = 0;
   for (let a = 0; a < AGENTS; a++) {
     const id = `agent-${a}`;
-    baseBytes = (await cell.create(id)).baseBytes;
+    const created = await cell.create(id);
+    baseBytes = created.engine + created.harness;
     const t0 = performance.now();
     let correct = 0;
     for (let t = 1; t <= TURNS; t++) {
@@ -58,7 +59,7 @@ async function benchImage() {
     }
     const ms = performance.now() - t0;
     const sizes = store.sizes(id);
-    const stats = cell.stats(id);
+    const stats = await cell.stats(id);
     const last = cell.metrics.filter((m) => m.agentId === id);
     const folds = last.filter((m) => m.kind === "base");
     perAgent.push({ id, correct, ms, msPerTurn: ms / TURNS, ...sizes, writtenPerTurn: last.reduce((s, m) => s + m.checkpointBytes, 0) / TURNS, journalPerTurn: sizes.journal / TURNS, cold: store.coldBytes(id), lastBase: folds.at(-1)?.checkpointBytes ?? baseBytes, heapUsed: last.at(-1).heapUsed, objects: last.at(-1).objects, linearBytes: last.at(-1).linearBytes, stats, activations: last.length });
@@ -66,7 +67,7 @@ async function benchImage() {
   const acts = cell.metrics.filter((m) => m.tier === "hot");
   const byKind = {};
   for (const m of acts) { const k = `${m.kind}:${m.calls ? "park" : "reply"}`; (byKind[k] ??= []).push(m.checkpointBytes); }
-  const msgs = store.messageStats();
+  const msgs = store.bodyStats();
 
   // restore tiers on the last agent, after TURNS turns; median of 7
   const id = perAgent.at(-1).id;
@@ -82,7 +83,7 @@ async function benchImage() {
   }
   // model-context bytes per request: what the heap sent (window + handles)
   const modelCalls = store.db.prepare("SELECT data FROM journal WHERE agent = ? AND kind = 'call'").all(id).map((r) => JSON.parse(r.data)).filter((d) => d.name === "model");
-  const bodyOf = store.db.prepare("SELECT LENGTH(body) AS n FROM messages WHERE hash = ?");
+  const bodyOf = store.db.prepare("SELECT LENGTH(body) AS n FROM bodies WHERE hash = ?");
   const ctxBytes = modelCalls.map((c) => c.messages.reduce((s, h) => s + bodyOf.get(h).n, 0));
   const file = inspectSqlite(join(work, "image.sqlite"));
 
@@ -91,7 +92,7 @@ async function benchImage() {
     checkpointBytes: Object.fromEntries(Object.entries(byKind).map(([k, v]) => [k, { median: median(v), max: Math.max(...v), n: v.length }])),
     snapshotMs: median(acts.map((m) => m.snapshotMs)), commitMs: median(acts.map((m) => m.commitMs)), runMs: median(acts.map((m) => m.runMs)),
     tiers, modelContextBytes: { first: ctxBytes[0], last: ctxBytes.at(-1), median: median(ctxBytes), max: Math.max(...ctxBytes) },
-    messagesTable: msgs, fileBytes: file.file, tables: file.tables,
+    bodiesTable: msgs, fileBytes: file.file, tables: file.tables, rebuildChecks: cell.rebuilds.length, rebuildOk: cell.rebuilds.every((r) => r.ok), rebuildMs: median(cell.rebuilds.map((r) => r.ms)),
     broker: { modelCalls: broker.modelCalls, cacheHits: broker.cacheHits, toolCalls: broker.toolCalls },
   };
   const p = perAgent[0];
@@ -101,6 +102,7 @@ async function benchImage() {
   log(`  checkpoint bytes:`, Object.entries(results.image.checkpointBytes).map(([k, v]) => `${k} med ${v.median} max ${v.max}`).join("; "));
   log(`  restore: hot ${tiers.hot.restoreMs.toFixed(2)} ms, warm ${tiers.warm.restoreMs.toFixed(2)} ms (instantiate ${tiers.warm.instantiateMs.toFixed(2)} + apply ${tiers.warm.applyMs.toFixed(2)}), cold ${tiers.cold.restoreMs.toFixed(2)} ms; chain ${tiers.warm.chainLength} deltas, ${kb(tiers.warm.chainBytes)} KB`);
   log(`  model context bytes per request: first ${ctxBytes[0]}, median ${median(ctxBytes)}, last ${ctxBytes.at(-1)}`);
+  log(`  rebuild checks at folds: ${cell.rebuilds.length}, all equal: ${cell.rebuilds.every((r) => r.ok)}, median ${median(cell.rebuilds.map((r) => r.ms)).toFixed(1)} ms over ${cell.rebuilds.at(-1)?.events} events`);
   store.close();
 }
 

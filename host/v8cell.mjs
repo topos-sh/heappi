@@ -13,9 +13,12 @@ const script = new vm.Script(HARNESS_SRC, { filename: "harness.js" });
 export class V8Cell {
   constructor(broker) { this.broker = broker; this.agents = new Map(); }
   create(agentId) {
+    // the harness context plus two script contexts, bridged the way the shim does it: strings only
     const ctx = vm.createContext({ __log: () => {} });
+    const scripts = [null, 1, 2].map((i) => i && vm.createContext({ __hostCall: (op, json) => ctx.__scriptCall(i, op, json) }));
+    ctx.__evalIn = (i, src) => vm.runInContext(src, scripts[i], { filename: "<script>" });
     script.runInContext(ctx);
-    this.agents.set(agentId, { ctx, deliver: ctx.__deliver, drain: ctx.__drain, stats: ctx.__stats });
+    this.agents.set(agentId, { ctx, scripts, deliver: ctx.__deliver, drain: ctx.__drain, stats: ctx.__stats });
   }
   async turn(agentId, event) {
     const a = this.agents.get(agentId);

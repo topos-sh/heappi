@@ -23,9 +23,9 @@ for (let t = 1; t <= turns; t++) {
   for (const r of recs) console.log(`  act tier=${r.tier.padEnd(4)} restore=${r.restoreMs.toFixed(2)}ms run=${r.runMs.toFixed(2)}ms ${r.kind} ${r.checkpointBytes}B snap=${r.snapshotMs.toFixed(2)}ms commit=${r.commitMs.toFixed(2)}ms calls=${r.calls} heap=${(r.heapUsed / 1024).toFixed(0)}KB` + (r.replies.length ? `  reply: ${r.replies[0].text}` : ""));
   const reply = recs.flatMap((r) => r.replies)[0];
   const ok = reply && reply.text.includes(`has ${expectedCount(t)} records`);
-  console.log(`turn ${t}: ${ok ? "correct" : "WRONG " + JSON.stringify(reply)}`, cell.stats(id));
+  console.log(`turn ${t}: ${ok ? "correct" : "WRONG " + JSON.stringify(reply)}`, await cell.stats(id));
 }
-console.log("sizes", store.sizes(id), "cold bytes", store.coldBytes(id), "messages", store.messageStats());
-console.log("handle $r1 head:", JSON.stringify(cell.peek(id, "$r1")).slice(0, 120));
+console.log("sizes", store.sizes(id), "cold bytes", store.coldBytes(id), "bodies", store.bodyStats(), "rebuild checks", cell.rebuilds);
+console.log("handle $r1 head:", JSON.stringify(await cell.peek(id, "$r1")).slice(0, 120));
 console.log("broker", { modelCalls: broker.modelCalls, cacheHits: broker.cacheHits, toolCalls: broker.toolCalls });
 store.close();
