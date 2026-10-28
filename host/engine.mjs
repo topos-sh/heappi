@@ -5,6 +5,7 @@
 export const SNAPSHOT_BASE = 1 << 0;
 export const SNAPSHOT_DELTA = 1 << 1;
 export const SNAPSHOT_CHAIN = 1 << 2;
+export const SNAPSHOT_FOLD = 1 << 3; // a checkpoint relative to the anchor layer
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -129,8 +130,9 @@ export class Engine {
     return out;
   }
 
-  /** restore base + chained deltas into a fresh runtime inside this instance */
-  restore(base, deltas = []) {
+  /** restore base + chained deltas into a fresh runtime inside this instance;
+      anchorAfter = index of the delta whose state becomes the fold anchor */
+  restore(base, deltas = [], { anchorAfter = -1 } = {}) {
     const bptr = this.#putBytes(base);
     const n = deltas.length;
     const ptrs = deltas.map((d) => this.#putBytes(d));
@@ -141,7 +143,7 @@ export class Engine {
       dv.setUint32(arr + 4 * i, ptrs[i], true);
       dv.setUint32(lens + 4 * i, deltas[i].length, true);
     }
-    const rc = this.x.ai_restore(bptr, base.length, arr, lens, n);
+    const rc = this.x.ai_restore(bptr, base.length, arr, lens, n, anchorAfter);
     this.x.ai_free(bptr); ptrs.forEach((p) => this.x.ai_free(p));
     this.x.ai_free(arr); this.x.ai_free(lens);
     if (rc !== 0) throw new Error(`restore: ${this.error()}`);
@@ -149,6 +151,8 @@ export class Engine {
   }
 
   baseId() { this.x.ai_base_id(); return this.result(); }
+  setAnchor() { if (this.x.ai_set_anchor() !== 0) throw new Error(`anchor: ${this.error()}`); }
+  anchorId() { this.x.ai_anchor_id(); return this.result(); }
   mem() { this.x.ai_mem(); return JSON.parse(this.result()); }
   gc() { this.x.ai_gc(); }
 }

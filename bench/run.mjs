@@ -61,8 +61,8 @@ async function benchImage() {
     const sizes = store.sizes(id);
     const stats = await cell.stats(id);
     const last = cell.metrics.filter((m) => m.agentId === id);
-    const folds = last.filter((m) => m.kind === "base");
-    perAgent.push({ id, correct, ms, msPerTurn: ms / TURNS, ...sizes, writtenPerTurn: last.reduce((s, m) => s + m.checkpointBytes, 0) / TURNS, journalPerTurn: sizes.journal / TURNS, cold: store.coldBytes(id), lastBase: folds.at(-1)?.checkpointBytes ?? baseBytes, heapUsed: last.at(-1).heapUsed, objects: last.at(-1).objects, linearBytes: last.at(-1).linearBytes, stats, activations: last.length });
+    const folds = last.filter((m) => m.kind === "fold");
+    perAgent.push({ id, correct, ms, msPerTurn: ms / TURNS, ...sizes, writtenPerTurn: last.reduce((s, m) => s + m.checkpointBytes, 0) / TURNS, journalPerTurn: sizes.journal / TURNS, cold: store.coldBytes(id), lastBase: folds.at(-1)?.checkpointBytes ?? 0, heapUsed: last.at(-1).heapUsed, objects: last.at(-1).objects, linearBytes: last.at(-1).linearBytes, stats, activations: last.length });
   }
   const acts = cell.metrics.filter((m) => m.tier === "hot");
   const byKind = {};

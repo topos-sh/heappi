@@ -46,7 +46,7 @@ async function run(name, harnessSrc) {
   const mem = acts.at(-1);
   const r = { name, correct, msPerTurn: ms / TURNS, layers: created.engine + created.harness, harnessLayer: created.harness, createMs: created.restoreMs,
     parkMedian: median(parks.map((m) => m.checkpointBytes)), parkMax: Math.max(...parks.map((m) => m.checkpointBytes)), replyMedian: median(replies.map((m) => m.checkpointBytes)),
-    writtenPerTurn: acts.reduce((s, m) => s + m.checkpointBytes, 0) / TURNS, chainLive: sizes.chainLive, journal: sizes.journal, folds: acts.filter((m) => m.kind === "base").length, rebuilds: cell.rebuilds.length, rebuildOk: cell.rebuilds.every((x) => x.ok), rebuildMs: median(cell.rebuilds.map((x) => x.ms)),
+    writtenPerTurn: acts.reduce((s, m) => s + m.checkpointBytes, 0) / TURNS, chainLive: sizes.chainLive, journal: sizes.journal, folds: acts.filter((m) => m.kind === "fold").length, rebuilds: cell.rebuilds.length, rebuildOk: cell.rebuilds.every((x) => x.ok), rebuildMs: median(cell.rebuilds.map((x) => x.ms)),
     snapshotMs: median(acts.map((m) => m.snapshotMs)), runMs: median(acts.map((m) => m.runMs)), heapUsed: mem.heapUsed, objects: mem.objects, linearBytes: mem.linearBytes, ctxLast: ctx.at(-1), tiers, journalKinds: store.journal(id).reduce((m, x) => (m[x.kind] = (m[x.kind] ?? 0) + 1, m), {}) };
   store.close();
   return r;

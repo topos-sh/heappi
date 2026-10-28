@@ -8,7 +8,7 @@
 // and the hot-tier eviction when the wasm memory bloats.
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { NodeEngine as Engine, SNAPSHOT_BASE, SNAPSHOT_CHAIN } from "./engine-node.mjs";
+import { NodeEngine as Engine, SNAPSHOT_BASE, SNAPSHOT_CHAIN, SNAPSHOT_FOLD } from "./engine-node.mjs";
 
 export const HARNESS_PATH = fileURLToPath(new URL("../heap/harness.js", import.meta.url));
 
@@ -56,7 +56,7 @@ export class Cell {
     const epoch = this.store.lease(agentId);
     const engine = await this.#fresh();
     const t0 = performance.now();
-    engine.restore(this.store.getLayer(layers[0]), [this.store.getLayer(layers[1])]);
+    engine.restore(this.store.getLayer(layers[0]), [this.store.getLayer(layers[1])], { anchorAfter: 0 }); // the harness layer is the anchor of the folds
     this.hot.set(agentId, { engine, epoch, lastApplyMs: 0 });
     return { layers, ...this.layerBytes, restoreMs: performance.now() - t0 };
   }
@@ -77,7 +77,7 @@ export class Cell {
     const tRead = performance.now();
     const engine = await this.#fresh();
     const tInst = performance.now();
-    engine.restore(chain.base, chain.deltas);
+    engine.restore(chain.base, chain.deltas, { anchorAfter: chain.anchorAfter ?? -1 });
     const now = performance.now();
     this.hot.set(agentId, { engine, epoch, lastApplyMs: now - tInst });
     return { engine, tier: forceTier === "cold" ? "cold" : "warm", restoreMs: now - t0, readMs: tRead - t0, instantiateMs: tInst - tRead, applyMs: now - tInst, chainLength: chain.length, chainBytes: chain.base.length + chain.deltas.reduce((s, d) => s + d.length, 0) };
@@ -131,21 +131,22 @@ export class Cell {
       this.onOutbox?.(agentId, o);
     }
 
-    // the writer folds: when the deltas outweigh the base, after foldEvery deltas, or when the last restore was slow
+    // the writer folds relative to the harness layer: when the checkpoints since the last fold
+    // outweigh it, after foldEvery of them, or when the last restore was slow
     const shape = this.store.chainShape(agentId);
     const slow = (this.hot.get(agentId)?.lastApplyMs ?? 0) > this.foldMaxApplyMs;
-    const kind = shape.deltas + 1 >= this.foldEvery || shape.deltaBytes >= Math.max(shape.baseBytes, this.foldMinBytes) || slow ? "base" : "chain";
+    const kind = shape.deltas + 1 >= this.foldEvery || shape.deltaBytes >= Math.max(shape.baseBytes, this.foldMinBytes) || slow ? "fold" : "chain";
     const tSnap = performance.now();
     if (this.gcBeforeSnapshot) engine.gc();
-    const bytes = engine.snapshot(kind === "base" ? SNAPSHOT_BASE : SNAPSHOT_CHAIN);
+    const bytes = engine.snapshot(kind === "fold" ? SNAPSHOT_FOLD : SNAPSHOT_CHAIN);
     const snapshotMs = performance.now() - tSnap;
     const mem = engine.mem();
 
     // at a fold, check that the journal rebuilds this state (the harness is a fold over the journal)
     let rebuild;
-    if (kind === "base" && this.checkRebuild) rebuild = await this.rebuildCheck(agentId, engine, journal);
+    if (kind === "fold" && this.checkRebuild) rebuild = await this.rebuildCheck(agentId, engine, journal);
 
-    const metrics = { runMs, snapshotMs, objects: mem.obj_count, heapUsed: mem.memory_used, linearBytes: engine.linearBytes, events: events.length, calls: outbox.length, chainLength: loaded.chainLength ?? shape.deltas, applyMs: loaded.applyMs, wait: outbox.length ? outbox[0].name : "reply", foldReason: kind === "base" ? (slow ? "slow-restore" : "bytes") : undefined };
+    const metrics = { runMs, snapshotMs, objects: mem.obj_count, heapUsed: mem.memory_used, linearBytes: engine.linearBytes, events: events.length, calls: outbox.length, chainLength: loaded.chainLength ?? shape.deltas, applyMs: loaded.applyMs, wait: outbox.length ? outbox[0].name : "reply", foldReason: kind === "fold" ? (slow ? "slow-restore" : "bytes") : undefined };
     if (rebuild) journal.push({ kind: "rebuild_check", data: rebuild });
     const tCommit = performance.now();
     this.store.commit(agentId, epoch, { checkpoint: { kind, bytes, metrics }, journal, outbox, processed: events.map((e) => e.seq) });
@@ -174,7 +175,7 @@ export class Cell {
     const t0 = performance.now();
     const [engineHash, harnessHash] = this.store.layersOf(agentId);
     const scratch = await this.#fresh();
-    scratch.restore(this.store.getLayer(engineHash), [this.store.getLayer(harnessHash)]);
+    scratch.restore(this.store.getLayer(engineHash), [this.store.getLayer(harnessHash)], { anchorAfter: 0 });
     const rows = [...this.store.journal(agentId), ...pendingJournal.map((j) => ({ kind: j.kind, data: j.data }))];
     let events = 0;
     for (const j of rows) {

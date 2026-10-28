@@ -6,7 +6,7 @@
 set -e
 cd "$(dirname "$0")"
 ENGINE="${ENGINE:-../../dquickts-chain}"
-WASI_SDK="${WASI_SDK:?set WASI_SDK to a wasi-sdk root}"
+WASI_SDK="${WASI_SDK:-../../.toolchains/wasi-sdk-25.0-arm64-macos}"
 VERSION="$(cat "$ENGINE/VERSION")"
 CC="$WASI_SDK/bin/clang"
 SRCS="$ENGINE/quickjs.c $ENGINE/dtoa.c $ENGINE/libregexp.c $ENGINE/libunicode.c $ENGINE/cutils.c shim.c"

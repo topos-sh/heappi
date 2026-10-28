@@ -113,7 +113,7 @@ export class Store {
   commit(id, epoch, { checkpoint, journal = [], outbox = [], processed = [] }) {
     const a = this.agent(id);
     const headSeq = a.head_seq + 1;
-    const baseSeq = checkpoint.kind === "base" ? headSeq : a.base_seq;
+    const baseSeq = checkpoint.kind === "fold" ? headSeq : a.base_seq;
     let jseq = a.journal_seq;
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -123,31 +123,33 @@ export class Store {
       for (const j of journal) this.q.putJournal.run(id, ++jseq, j.kind, JSON.stringify(j.data));
       for (const o of outbox) this.q.putOutbox.run(id, o.id, o.name, JSON.stringify(o.args));
       for (const seq of processed) this.q.markProcessed.run(seq);
-      if (checkpoint.kind === "base") this.q.sweep.run(id, headSeq); // the sweeper, inline
+      if (checkpoint.kind === "fold") this.q.sweep.run(id, headSeq); // the sweeper, inline: a fold replaces everything before it
       this.db.exec("COMMIT");
     } catch (e) { this.db.exec("ROLLBACK"); throw e; }
     if (this.coldDir) this.replicate(id, headSeq, checkpoint, journal);
     return { headSeq, baseSeq };
   }
 
-  /** the chain to restore from: layers or own base, plus checkpoints after it */
+  /**
+   * The chain to restore from. Always the engine layer as the base, then the
+   * harness layer (the anchor of the folds), then the latest fold if any,
+   * then the checkpoints after it. `anchorAfter` is the index of the harness
+   * layer among the deltas, for the engine to rebuild the anchor.
+   */
   chain(id) {
     const a = this.agent(id);
     if (!a) return null;
-    if (a.base_seq === 0) {
-      const [engine, harness] = this.layersOf(id);
-      const rows = this.q.chain.all(id, 1);
-      return { base: this.getLayer(engine), deltas: [this.getLayer(harness), ...rows.map((r) => this.#verify(r.bytes, r.mac, `checkpoint ${r.seq}`))], baseSeq: 0, headSeq: a.head_seq, length: rows.length + 1, fromLayers: true };
-    }
-    const rows = this.q.chain.all(id, a.base_seq);
-    return { base: this.#verify(rows[0].bytes, rows[0].mac, "base"), deltas: rows.slice(1).map((r) => this.#verify(r.bytes, r.mac, `checkpoint ${r.seq}`)), baseSeq: a.base_seq, headSeq: a.head_seq, length: rows.length - 1, fromLayers: false };
+    const [engine, harness] = this.layersOf(id);
+    const rows = this.q.chain.all(id, Math.max(a.base_seq, 1));
+    const deltas = [this.getLayer(harness), ...rows.map((r) => this.#verify(r.bytes, r.mac, `checkpoint ${r.seq}`))];
+    return { base: this.getLayer(engine), deltas, anchorAfter: 0, baseSeq: a.base_seq, headSeq: a.head_seq, length: deltas.length, fromLayers: true };
   }
-  /** bytes of the current base (or layers) and of the deltas since it */
+  /** bytes of the latest fold (or 0) and of the checkpoints since it */
   chainShape(id) {
     const a = this.agent(id);
-    const base = a.base_seq === 0 ? this.layersOf(id).reduce((s, h) => s + this.q.getLayer.get(h).size, 0) : (this.q.baseSize.get(id, a.base_seq)?.size ?? 0);
+    const fold = a.base_seq ? (this.q.baseSize.get(id, a.base_seq)?.size ?? 0) : 0;
     const live = this.q.liveSizes.get(id, Math.max(a.base_seq, 1)).live;
-    return { baseBytes: base, deltaBytes: a.base_seq === 0 ? live : live - base, deltas: a.head_seq - a.base_seq };
+    return { baseBytes: fold, deltaBytes: live - fold, deltas: a.head_seq - Math.max(a.base_seq, 0) - (a.base_seq ? 0 : 0), layersBytes: this.layersOf(id).reduce((s, h) => s + this.q.getLayer.get(h).size, 0) };
   }
 
   journal(id) { return this.q.journal.all(id).map((r) => ({ seq: r.seq, kind: r.kind, data: JSON.parse(r.data) })); }
@@ -173,20 +175,19 @@ export class Store {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, `${String(seq).padStart(6, "0")}-${checkpoint.kind}.bin`), checkpoint.bytes);
     if (journal.length) appendFileSync(join(dir, "journal.jsonl"), journal.map((j) => JSON.stringify(j)).join("\n") + "\n");
-    if (checkpoint.kind === "base") for (const f of readdirSync(dir)) { const m = /^(\d{6})-(base|chain)\.bin$/.exec(f); if (m && Number(m[1]) < seq) rmSync(join(dir, f)); }
+    if (checkpoint.kind === "fold") for (const f of readdirSync(dir)) { const m = /^(\d{6})-(fold|chain)\.bin$/.exec(f); if (m && Number(m[1]) < seq) rmSync(join(dir, f)); }
   }
   coldChain(id) {
     const dir = join(this.coldDir, id);
     if (!existsSync(dir)) return null;
     const files = readdirSync(dir).filter((f) => /\.bin$/.test(f)).sort();
-    const bi = files.findLastIndex((f) => f.endsWith("-base.bin"));
-    if (bi < 0) {
-      const [engine, harness] = this.layersOf(id);
-      const ld = join(this.coldDir, "layers");
-      const layer = (h, k) => new Uint8Array(readFileSync(join(ld, `${h}-${k}.bin`)));
-      return { base: layer(engine, "engine"), deltas: [layer(harness, "harness"), ...files.map((f) => new Uint8Array(readFileSync(join(dir, f))))], length: files.length + 1 };
-    }
-    return { base: new Uint8Array(readFileSync(join(dir, files[bi]))), deltas: files.slice(bi + 1).map((f) => new Uint8Array(readFileSync(join(dir, f)))), length: files.length - bi - 1 };
+    const fi = files.findLastIndex((f) => f.endsWith("-fold.bin"));
+    const tail = files.slice(Math.max(fi, 0));
+    const [engine, harness] = this.layersOf(id);
+    const ld = join(this.coldDir, "layers");
+    const layer = (h, k) => new Uint8Array(readFileSync(join(ld, `${h}-${k}.bin`)));
+    const deltas = [layer(harness, "harness"), ...tail.map((f) => new Uint8Array(readFileSync(join(dir, f))))];
+    return { base: layer(engine, "engine"), deltas, anchorAfter: 0, length: deltas.length };
   }
   coldBytes(id) { const dir = join(this.coldDir, id); if (!existsSync(dir)) return 0; return readdirSync(dir).reduce((s, f) => s + statSync(join(dir, f)).size, 0); }
 

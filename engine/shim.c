@@ -286,21 +286,34 @@ EXPORT("ai_snap_ptr") const uint8_t *ai_snap_ptr(void) { return snap_buf; }
 EXPORT("ai_snap_len") size_t ai_snap_len(void) { return snap_len; }
 EXPORT("ai_snap_free") void ai_snap_free(void) { if (snap_buf) { js_free_rt(rt, snap_buf); snap_buf = NULL; snap_len = 0; } }
 
-/* restore base + n chained deltas into a fresh runtime (replaces the current one) */
+/* restore base + n chained deltas into a fresh runtime (replaces the
+   current one); anchor >= 0 makes the state after that delta the anchor
+   of the folds */
 EXPORT("ai_restore") int ai_restore(const uint8_t *base, size_t base_len,
-                                    const uint8_t *const *deltas, const size_t *lens, int n) {
+                                    const uint8_t *const *deltas, const size_t *lens, int n, int anchor) {
     ai_drop();
     new_runtime();
     JSSnapshotResult res;
     int rc = n == 0
         ? JS_ReadSnapshot(rt, base, base_len, NULL, 0, &host, &res, errbuf, sizeof errbuf)
-        : JS_ReadSnapshotChain(rt, base, base_len, deltas, lens, n, &host, &res, errbuf, sizeof errbuf);
+        : JS_ReadSnapshotChainAnchored(rt, base, base_len, deltas, lens, n, anchor, &host, &res, errbuf, sizeof errbuf);
     if (rc) { JS_FreeRuntime(rt); rt = NULL; return -1; }
     ctx_count = res.context_count < MAX_CTX ? res.context_count : MAX_CTX;
     for (int i = 0; i < ctx_count; i++) ctxs[i] = res.contexts[i];
     ctx = ctxs[0];
     JS_FreeSnapshotResult(rt, &res);
     return 0;
+}
+
+/* the current base becomes the anchor of the folds; 0 on success */
+EXPORT("ai_set_anchor") int ai_set_anchor(void) {
+    if (JS_SetSnapshotAnchor(ctx)) { set_error_from_exception(ctx); return -1; }
+    return 0;
+}
+EXPORT("ai_anchor_id") void ai_anchor_id(void) {
+    char tmp[32];
+    snprintf(tmp, sizeof tmp, "%llu", (unsigned long long)JS_GetSnapshotAnchorId(rt));
+    set_result_str(tmp);
 }
 
 EXPORT("ai_base_id") void ai_base_id(void) {
