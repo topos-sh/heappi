@@ -1,0 +1,16 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "agent-image-test",
+  "main": "src/index.mjs",
+  "compatibility_date": "2025-10-01",
+  "rules": [
+    { "type": "CompiledWasm", "globs": ["**/*.wasm"] },
+    { "type": "Text", "globs": ["**/*.txt"] }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "CELL", "class_name": "AgentCell" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AgentCell"] }],
+  "r2_buckets": [{ "binding": "COLD", "bucket_name": "agent-image-cold" }],
+  "observability": { "enabled": true }
+}

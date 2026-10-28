@@ -1,30 +1,42 @@
-// Node wrapper over engine/agent-image.wasm (a wasm32-wasi reactor).
-// One Engine = one wasm instance = one heap. The module is compiled once.
-import { readFile } from "node:fs/promises";
-import { WASI } from "node:wasi";
-import { fileURLToPath } from "node:url";
+// Wrapper over engine/agent-image.wasm (a wasm32-wasi reactor), runtime
+// agnostic: give it an instantiated module. One Engine = one instance = one
+// heap. Node loading lives in engine-node.mjs; Workers use cf/src/wasi.mjs.
 
 export const SNAPSHOT_BASE = 1 << 0;
 export const SNAPSHOT_DELTA = 1 << 1;
 export const SNAPSHOT_CHAIN = 1 << 2;
 
-const WASM_PATH = fileURLToPath(new URL("../engine/agent-image.wasm", import.meta.url));
-let compiled; // Promise<WebAssembly.Module>
-
-export function compileEngine() {
-  compiled ??= readFile(WASM_PATH).then((b) => WebAssembly.compile(b));
-  return compiled;
-}
-
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
+/** the five WASI imports the engine needs, over a memory getter */
+export function wasiImports(getMemory, log = (s) => console.error(s)) {
+  const u8 = () => new Uint8Array(getMemory().buffer);
+  const dv = () => new DataView(getMemory().buffer);
+  let pending = "";
+  return { wasi_snapshot_preview1: {
+    clock_time_get(_id, _precision, out) { dv().setBigUint64(out, BigInt(Math.round(nowNs())), true); return 0; },
+    fd_write(fd, iovs, iovsLen, nwritten) {
+      let n = 0; const d = dv(); const u = u8();
+      for (let i = 0; i < iovsLen; i++) { const p = d.getUint32(iovs + 8 * i, true), l = d.getUint32(iovs + 8 * i + 4, true); pending += dec.decode(u.subarray(p, p + l)); n += l; }
+      d.setUint32(nwritten, n, true);
+      let nl; while ((nl = pending.indexOf("\n")) >= 0) { log(pending.slice(0, nl)); pending = pending.slice(nl + 1); }
+      return 0;
+    },
+    fd_close() { return 0; },
+    fd_seek() { return 8; },
+    random_get(ptr, len) { crypto.getRandomValues(u8().subarray(ptr, ptr + len)); return 0; },
+  } };
+}
+function nowNs() { return (typeof performance !== "undefined" ? performance.timeOrigin + performance.now() : Date.now()) * 1e6; }
+
 export class Engine {
-  static async create() {
-    const mod = await compileEngine();
-    const wasi = new WASI({ version: "preview1", args: ["agent-image"], env: {}, returnOnExit: false });
-    const inst = await WebAssembly.instantiate(mod, wasi.getImportObject());
-    wasi.initialize(inst);
+  /** instantiate synchronously from a compiled module (Workers, or Node after compile) */
+  static fromModule(mod, log) {
+    let inst;
+    const imports = wasiImports(() => inst.exports.memory, log);
+    inst = new WebAssembly.Instance(mod, imports);
+    inst.exports._initialize();
     return new Engine(inst);
   }
 
@@ -78,6 +90,7 @@ export class Engine {
   drop() { if (this.live) { this.x.ai_drop(); this.live = false; } }
 
   setBudgetMs(ms) { this.x.ai_set_budget_ms(ms); }
+  setBudgetTicks(n) { this.x.ai_set_budget_ticks(n); }
   ticks() { return this.x.ai_ticks(); }
 
   /** evaluate a script in the global scope; returns "done" | "suspended" */

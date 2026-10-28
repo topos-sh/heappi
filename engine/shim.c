@@ -24,7 +24,9 @@ static size_t result_len;
 static uint8_t *snap_buf;     /* last snapshot, js_malloc'd on rt */
 static size_t snap_len;
 static double budget_ms;      /* 0 = no budget */
+static long budget_ticks;     /* 0 = no budget; for hosts whose clock is frozen during CPU work */
 static double run_start_ms;
+static long run_start_ticks;
 static long interrupt_ticks;
 
 static double now_ms(void) {
@@ -87,6 +89,8 @@ static int interrupt_handler(JSRuntime *r, void *opaque) {
     interrupt_ticks++;
     if (budget_ms > 0 && now_ms() - run_start_ms > budget_ms)
         JS_RequestSuspend(r);
+    if (budget_ticks > 0 && interrupt_ticks - run_start_ticks >= budget_ticks)
+        JS_RequestSuspend(r);
     return 0;
 }
 
@@ -123,6 +127,7 @@ EXPORT("ai_result_len") size_t ai_result_len(void) { return result_len; }
 EXPORT("ai_ticks") long ai_ticks(void) { return interrupt_ticks; }
 
 EXPORT("ai_set_budget_ms") void ai_set_budget_ms(double ms) { budget_ms = ms; }
+EXPORT("ai_set_budget_ticks") void ai_set_budget_ticks(long n) { budget_ticks = n; }
 
 /* fresh runtime with the natives installed; 0 on success */
 EXPORT("ai_init") int ai_init(void) {
@@ -143,7 +148,7 @@ EXPORT("ai_drop") void ai_drop(void) {
 
 /* evaluate a script in the global scope; 0 = done, 1 = suspended, -1 = error */
 EXPORT("ai_eval") int ai_eval(const char *src, size_t len, const char *name) {
-    run_start_ms = now_ms();
+    run_start_ms = now_ms(); run_start_ticks = interrupt_ticks;
     JSValue v = JS_Eval(ctx, src, len, name ? name : "<eval>", JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(v)) {
         if (JS_IsSuspended(rt)) return 1;
@@ -167,7 +172,7 @@ EXPORT("ai_call") int ai_call(const char *fn, const char *arg, size_t arglen) {
         return -1;
     }
     JSValue a = arg ? JS_NewStringLen(ctx, arg, arglen) : JS_UNDEFINED;
-    run_start_ms = now_ms();
+    run_start_ms = now_ms(); run_start_ticks = interrupt_ticks;
     JSValue v = JS_Call(ctx, f, JS_UNDEFINED, arg ? 1 : 0, (JSValueConst *)&a);
     JS_FreeValue(ctx, a);
     JS_FreeValue(ctx, f);
@@ -184,7 +189,7 @@ EXPORT("ai_call") int ai_call(const char *fn, const char *arg, size_t arglen) {
 /* continue a suspended execution; same statuses as ai_call */
 EXPORT("ai_resume") int ai_resume(void) {
     if (!JS_IsSuspended(rt)) { snprintf(errbuf, sizeof errbuf, "nothing suspended"); return -1; }
-    run_start_ms = now_ms();
+    run_start_ms = now_ms(); run_start_ticks = interrupt_ticks;
     JSValue v = JS_Resume(ctx);
     if (JS_IsException(v)) {
         if (JS_IsSuspended(rt)) return 1;
@@ -199,7 +204,7 @@ EXPORT("ai_resume") int ai_resume(void) {
 EXPORT("ai_is_suspended") int ai_is_suspended(void) { return rt && JS_IsSuspended(rt); }
 
 /* run the job queue only; 0 = quiescent, -1 = error */
-EXPORT("ai_run") int ai_run(void) { run_start_ms = now_ms(); return run_jobs(); }
+EXPORT("ai_run") int ai_run(void) { run_start_ms = now_ms(); run_start_ticks = interrupt_ticks; return run_jobs(); }
 
 /* write a snapshot; flags = JS_SNAPSHOT_BASE / DELTA / CHAIN or 0; 0 on success */
 EXPORT("ai_snapshot") int ai_snapshot(int flags) {

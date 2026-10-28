@@ -1,6 +1,6 @@
 // Smoke test: pending promise across a chained checkpoint, restore in a
 // fresh instance, deliver the result, and a CPU-budget suspension.
-import { Engine, SNAPSHOT_BASE, SNAPSHOT_CHAIN } from "./engine.mjs";
+import { NodeEngine as Engine, SNAPSHOT_BASE, SNAPSHOT_CHAIN } from "./engine-node.mjs";
 
 const e = await Engine.create();
 e.init();

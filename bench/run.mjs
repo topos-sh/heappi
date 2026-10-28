@@ -14,7 +14,7 @@ import { parseArgs } from "node:util";
 import { Store } from "../host/store.mjs";
 import { Cell } from "../host/cell.mjs";
 import { Broker } from "../host/broker.mjs";
-import { Engine } from "../host/engine.mjs";
+import { NodeEngine as Engine } from "../host/engine-node.mjs";
 import { V8Cell } from "../host/v8cell.mjs";
 import { userMessage, expectedCount, DEFAULTS } from "../host/scenario.mjs";
 import { TranscriptStore, runTranscriptAgent } from "../baselines/transcript.mjs";

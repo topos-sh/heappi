@@ -3,7 +3,7 @@
 // state; it only moves events in, outbox entries out, and bytes around.
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { Engine, SNAPSHOT_BASE, SNAPSHOT_CHAIN } from "./engine.mjs";
+import { NodeEngine as Engine, SNAPSHOT_BASE, SNAPSHOT_CHAIN } from "./engine-node.mjs";
 
 const HARNESS_SRC = readFileSync(fileURLToPath(new URL("../heap/harness.js", import.meta.url)), "utf8");
 
