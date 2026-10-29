@@ -60,17 +60,29 @@ Notes:
 
 ## Run it
 
+Locally, with a real model (Node 24):
+
 ```bash
 npm install
-cp .env.example .env         # ANTHROPIC_API_KEY
-npm run app                  # Pi in the heap, Sonnet through pi-ai, MCP servers, signals, chat page at :8788
-npm run app:demo             # same with the scripted model, no key
-npm test                     # twelve checks: realm isolation, budget kill, rebuild hash, upgrade, tamper, dedup, eviction, memory limit, template restore
-node --expose-gc bench/run.mjs --turns 50 --agents 3 --mem-agents 40 && node bench/report.mjs
-node embed/pi-bench.mjs      # Pi in the heap against the small harness
+cp .env.example .env      # put ANTHROPIC_API_KEY in it
+npm run app               # chat page at http://localhost:8788
 ```
 
-Cloudflare: `./cf/sync.sh`, create an R2 bucket and name it in `cf/wrangler.demo.jsonc`, `npx wrangler@4 deploy --config cf/wrangler.demo.jsonc`, then `secret put` for `ANTHROPIC_API_KEY` and `DEMO_TOKEN`. The demo exposes `fetch`, `now`, `run`, `list_agents`, `send_to_agent`, a notes MCP server hosted in the Worker over R2, and the public Cloudflare docs and DeepWiki MCP servers; signals with a delay become Durable Object alarms. Rebuilding the engine needs wasi-sdk 25 and the dquickts fork; the binary is committed.
+`npm run app:demo` runs the same page with a scripted model and no key. The page has the conversation with streamed replies and tool calls, a panel with the agent's state (in memory or parked, checkpoint chain size, last restores), an "evict" button to force the next message through a restore, and a form for external signals with an optional delay.
+
+On Cloudflare:
+
+```bash
+./cf/sync.sh
+npx wrangler@4 r2 bucket create <bucket>     # then name it in cf/wrangler.demo.jsonc
+npx wrangler@4 deploy --config cf/wrangler.demo.jsonc
+npx wrangler@4 secret put ANTHROPIC_API_KEY --config cf/wrangler.demo.jsonc
+npx wrangler@4 secret put DEMO_TOKEN --config cf/wrangler.demo.jsonc     # the page asks for it once
+```
+
+One Durable Object per agent, R2 as the cold store, alarms for delayed signals. Tools in the demo: `fetch`, `now`, `run`, `list_agents`, `send_to_agent`, a notes MCP server hosted in the Worker over R2, and the public Cloudflare docs and DeepWiki MCP servers.
+
+`npm test` runs the checks; the benchmark scripts are in `bench/`, `baselines/` and `embed/`. Rebuilding the engine needs wasi-sdk 25 and the dquickts fork; the binary is committed.
 
 ## Map
 
