@@ -54,6 +54,7 @@ button.primary{font:inherit;padding:8px 14px;border:0;border-radius:6px;backgrou
   <h2>Agent</h2>
   <dl id="stats"></dl>
   <button id="evict" style="margin-top:8px">Evict hot copy (next event restores warm)</button>
+  <div id="manage" style="display:none;margin-top:8px;gap:6px"><button id="rename">Rename</button><button id="delete">Delete</button></div>
   <h2>Last activations</h2>
   <div id="acts" style="font-family:var(--mono);font-size:11.5px;color:var(--muted)"></div>
   <h2>Tools</h2>
@@ -61,7 +62,8 @@ button.primary{font:inherit;padding:8px 14px;border:0;border-radius:6px;backgrou
 </section>
 <script>
 const $ = (id) => document.getElementById(id);
-let current = null, es = null, streaming = null, lastStreamed = "";
+let current = null, es = null, streaming = null, lastStreamed = "", agents = [], hasNames = false;
+const nameOf = (id) => agents.find((a) => a.id === id)?.name ?? id;
 async function api(path, opts) {
   let r = await fetch("/api/agents" + path, opts);
   if (r.status === 401) { location.replace("/"); throw new Error("not signed in"); } // the Cloudflare demo: back to its login page
@@ -78,8 +80,10 @@ async function refreshAgents() {
   const r = await api("");
   $("model").textContent = (r.demo ? "demo model" : r.model) + " · " + r.tools.length + " tools" + (r.mcp ? " · MCP: " + r.mcp.join(", ") : "");
   $("tools").textContent = r.tools.join("\n");
+  agents = r.agents.map((a) => typeof a === "string" ? { id: a, name: a } : a); hasNames = r.agents.some((a) => typeof a !== "string"); // the Cloudflare demo names agents; the Node app lists ids
+  $("manage").style.display = hasNames && current ? "flex" : "none";
   $("agents").innerHTML = "";
-  for (const id of r.agents) { const b = document.createElement("button"); b.textContent = id; b.setAttribute("aria-current", String(id === current)); b.onclick = () => select(id); $("agents").appendChild(b); }
+  for (const a of agents) { const b = document.createElement("button"); b.textContent = a.name; b.title = a.id; b.setAttribute("aria-current", String(a.id === current)); b.onclick = () => select(a.id); $("agents").appendChild(b); }
 }
 async function refreshStats() {
   if (!current) return;
@@ -102,6 +106,7 @@ function select(id) {
     else if (ev.type === "activation") { const a = $("acts"); a.textContent = `${ev.tier}${ev.how && ev.how !== "hot" ? "/" + ev.how : ""} ${ev.kind} ${(ev.checkpointBytes / 1024).toFixed(1)} KB restore ${ev.restoreMs.toFixed(1)} ms run ${ev.runMs.toFixed(1)} ms heap ${(ev.heapUsed / 1024).toFixed(0)} KB\n` + a.textContent.split("\n").slice(0, 7).join("\n"); }
     else if (ev.type === "error" || ev.type === "pi.report") el("error", ev.error ?? ev.text);
     else if (ev.type === "sys") el("sys", ev.text);
+    else if (ev.type === "input") { const e = ev.event; el("msg signal", e.type === "signal" ? `[signal:${e.name}] ${typeof e.payload === "string" ? e.payload : JSON.stringify(e.payload ?? null)}` : e.text); }
   };
   refreshAgents(); refreshStats();
 }
@@ -109,6 +114,8 @@ $("new").onclick = async () => { const r = await api("", { method: "POST", heade
 $("send").onsubmit = async (e) => { e.preventDefault(); const text = $("text").value.trim(); if (!text || !current) return; $("text").value = ""; el("msg user", text); await api("/" + current + "/messages", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text }) }); };
 $("text").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("send").requestSubmit(); } });
 $("signal").onsubmit = async (e) => { e.preventDefault(); if (!current) return; let payload = $("spayload").value; try { payload = JSON.parse(payload); } catch {} const afterMs = Number($("safter").value) || 0; await api("/" + current + "/signals", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: $("sname").value || "ping", payload, afterMs }) }); el("sys", afterMs ? `signal scheduled in ${afterMs} ms` : "signal sent"); };
+$("rename").onclick = async () => { if (!current) return; const name = prompt("New name for " + nameOf(current) + ":", nameOf(current)); if (!name || name === nameOf(current)) return; const r = await api("/" + current + "/rename", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name }) }); if (r.error) alert(r.error); await refreshAgents(); };
+$("delete").onclick = async () => { if (!current) return; if (!confirm("Delete agent " + nameOf(current) + "? Its heap, journal and checkpoints are removed.")) return; await api("/" + current, { method: "DELETE" }); es?.close(); es = null; current = null; $("log").innerHTML = '<p class="sys">pick or create an agent</p>'; $("stats").innerHTML = ""; await refreshAgents(); };
 $("evict").onclick = async () => { if (!current) return; await api("/" + current + "/evict", { method: "POST" }); el("sys", "hot copy evicted; the next event restores from SQLite"); refreshStats(); };
 refreshAgents();
 </script>

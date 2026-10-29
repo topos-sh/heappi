@@ -29,6 +29,8 @@ const enc = new TextEncoder();
 const BUILTIN_TOOLS = [
   { name: "fetch", description: "Fetch a URL over HTTP and return its status and text (first 20 KB).", inputSchema: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } },
   { name: "now", description: "Current date and time, ISO 8601.", inputSchema: { type: "object", properties: {} } },
+  { name: "list_agents", description: "The other agents running in this deployment, by name.", inputSchema: { type: "object", properties: {} } },
+  { name: "send_to_agent", description: "Send a message to another agent by name. It arrives in that agent's mailbox as [signal:from:<your name>] and it may answer you the same way.", inputSchema: { type: "object", properties: { agent: { type: "string", description: "the recipient's name" }, text: { type: "string" } }, required: ["agent", "text"] } },
 ];
 const mcpFor = (env) => connectMcp({
   notes: { handler: notesServer(env.COLD) },
@@ -65,27 +67,52 @@ export default {
     try {
       if (!id && request.method === "GET") { const mcp = await mcpFor(env); return json({ agents: await index.list(), model: getGateway(env).modelId, demo: getGateway(env).modelId === "scripted", tools: (await catalogFor(env)).map((t) => t.name), mcp: mcp.servers }); }
       if (!id && request.method === "POST") {
-        const { id: want } = await request.json().catch(() => ({}));
+        const { id: want, name } = await request.json().catch(() => ({}));
         const newId = (want && /^[\w-]{1,40}$/.test(want) ? want : "agent-" + Date.now().toString(36));
         const stub = env.CELL.get(env.CELL.idFromName(newId));
         const r = await stub.fetch(new Request(`http://cell/api/agents/${newId}/create`, { method: "POST", body: JSON.stringify({ tools: await catalogFor(env) }) }));
         if (!r.ok) return r;
-        await index.add(newId);
-        return json({ id: newId, ...(await r.json()) });
+        const added = await index.add(newId, name);
+        return json({ id: newId, name: added.name, ...(await r.json()) });
       }
       if (!id) return json({ error: "method" }, 405);
       const stub = env.CELL.get(env.CELL.idFromName(id));
+      if (op === "rename" && request.method === "POST") { const { name } = await request.json().catch(() => ({})); const r = await index.rename(id, name); return r.error ? json(r, 400) : json(r); }
+      if ((op === "delete" && request.method === "POST") || (!op && request.method === "DELETE")) { await index.remove(id); return stub.fetch(new Request(`http://cell/api/agents/${id}/reset`, { method: "POST" })); }
       if (op === "reset" && request.method === "POST") await index.remove(id);
       return stub.fetch(request);
     } catch (e) { return json({ error: String(e?.stack ?? e) }, 500); }
   },
 };
 
+/** the list of agents with their display names; names are unique and are how agents address each other */
 export class AgentIndex extends DurableObject {
-  constructor(ctx, env) { super(ctx, env); this.sql = ctx.storage.sql; this.sql.exec("CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, created INTEGER)"); }
-  list() { return this.sql.exec("SELECT id FROM agents ORDER BY created").toArray().map((r) => r.id); }
-  add(id) { this.sql.exec("INSERT OR IGNORE INTO agents (id, created) VALUES (?, ?)", id, Date.now()); }
+  constructor(ctx, env) {
+    super(ctx, env); this.sql = ctx.storage.sql;
+    this.sql.exec("CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, name TEXT, created INTEGER)");
+    if (!this.sql.exec("PRAGMA table_info(agents)").toArray().some((c) => c.name === "name")) this.sql.exec("ALTER TABLE agents ADD COLUMN name TEXT"); // an index created before names
+    this.sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS agents_name ON agents (name)");
+    this.sql.exec("UPDATE agents SET name = id WHERE name IS NULL");
+  }
+  list() { return this.sql.exec("SELECT id, name FROM agents ORDER BY created").toArray().map((r) => ({ id: r.id, name: r.name })); }
+  validName(name) { return typeof name === "string" && /^[\w][\w .-]{0,39}$/.test(name) ? name.trim() : null; }
+  add(id, name) {
+    let n = this.validName(name) ?? id;
+    if (this.sql.exec("SELECT 1 FROM agents WHERE name = ? AND id != ?", n, id).toArray().length) n = `${n}-${id.slice(-4)}`;
+    this.sql.exec("INSERT OR IGNORE INTO agents (id, name, created) VALUES (?, ?, ?)", id, n, Date.now());
+    return { id, name: this.nameOf(id) };
+  }
+  rename(id, name) {
+    const n = this.validName(name);
+    if (!n) return { error: "a name is 1 to 40 letters, digits, space, dot, dash or underscore" };
+    if (this.sql.exec("SELECT 1 FROM agents WHERE name = ? AND id != ?", n, id).toArray().length) return { error: `another agent is called ${n}` };
+    this.sql.exec("UPDATE agents SET name = ? WHERE id = ?", n, id);
+    return { id, name: n };
+  }
   remove(id) { this.sql.exec("DELETE FROM agents WHERE id = ?", id); }
+  nameOf(id) { return this.sql.exec("SELECT name FROM agents WHERE id = ?", id).toArray()[0]?.name ?? id; }
+  /** an agent by name or id */
+  resolve(ref) { return this.sql.exec("SELECT id, name FROM agents WHERE name = ? OR id = ? LIMIT 1", ref, ref).toArray()[0] ?? null; }
 }
 
 export class DemoCell extends CellBase {
@@ -108,7 +135,7 @@ export class DemoCell extends CellBase {
 
   // ---- mailbox, outbox, events ----
   enqueue(event, sender) { this.sql.exec("INSERT INTO mailbox (sender, event) VALUES (?, ?)", sender, JSON.stringify(event)); }
-  pending() { return this.sql.exec("SELECT seq, event FROM mailbox WHERE processed = 0 ORDER BY seq").toArray().map((r) => ({ seq: r.seq, event: JSON.parse(r.event) })); }
+  pending() { return this.sql.exec("SELECT seq, sender, event FROM mailbox WHERE processed = 0 ORDER BY seq").toArray().map((r) => ({ seq: r.seq, sender: r.sender, event: JSON.parse(r.event) })); }
   publish(ev) {
     const bytes = enc.encode(`data: ${JSON.stringify(ev)}\n\n`);
     for (const w of this.subs) w.write(bytes).catch(() => { this.subs.delete(w); });
@@ -195,6 +222,7 @@ export class DemoCell extends CellBase {
           for (const c of calls) this.sql.exec("INSERT OR REPLACE INTO outbox (id, name, args, sent_at, done) VALUES (?, ?, ?, ?, 0)", c.id, c.name, JSON.stringify(c.args), Date.now());
         },
       });
+      for (const e of events) if (e.event.type === "signal" || (e.event.type === "user" && e.sender !== "ui")) this.publish({ type: "input", sender: e.sender, event: e.event });
       for (const o of out) if (o.kind === "progress" || o.kind === "error" || o.kind === "pi.report" || o.kind === "late_result") this.publish({ type: o.kind, ...o });
       this.publish({ type: "activation", tier: rec.tier, how: rec.how, kind: rec.kind, checkpointBytes: rec.checkpointBytes, restoreMs: rec.restoreMs, runMs: rec.runMs, calls: rec.calls, heapUsed: rec.heapUsed, chainLength: rec.chainLength, evicted: rec.evicted });
       for (const r of replies) this.publish({ type: "reply", text: r.text, turn: r.turn });
@@ -235,6 +263,17 @@ export class DemoCell extends CellBase {
         return { status: r.status, text: (await r.text()).slice(0, 20000) };
       }
       if (name === "now") return new Date().toISOString();
+      if (name === "list_agents") { const index = this.env.INDEX.get(this.env.INDEX.idFromName("index")); return (await index.list()).filter((a) => a.id !== this.agentId).map((a) => a.name); }
+      if (name === "send_to_agent") {
+        const index = this.env.INDEX.get(this.env.INDEX.idFromName("index"));
+        const to = await index.resolve(String(args?.agent ?? ""));
+        if (!to) throw new Error(`no agent called ${args?.agent}; list_agents gives the names`);
+        if (to.id === this.agentId) throw new Error("that is you");
+        const me = await index.nameOf(this.agentId);
+        const r = await this.env.CELL.get(this.env.CELL.idFromName(to.id)).fetch(new Request(`http://cell/api/agents/${to.id}/signals`, { method: "POST", body: JSON.stringify({ name: `from:${me}`, payload: String(args?.text ?? "") }) }));
+        if (!r.ok) throw new Error(`delivery to ${to.name} failed: ${(await r.text()).slice(0, 200)}`);
+        return `delivered to ${to.name}`;
+      }
       if (name.startsWith("mcp__")) return (await mcpFor(this.env)).call(name, args);
       throw new Error("unknown tool " + name);
     }

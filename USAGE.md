@@ -181,14 +181,15 @@ The same cell with Pi Durable inside, a real model, MCP servers, alarms, SSE and
 |---|---|
 | `GET /` | the chat page |
 | `GET /api/agents` | agents, model, tool catalog, MCP servers |
-| `POST /api/agents {id?}` | create an agent: layers, a `config` event with the catalog and instructions, first activation |
+| `POST /api/agents {id?, name?}` | create an agent: layers, a `config` event with the catalog and instructions, first activation |
+| `POST /api/agents/:id/rename {name}`, `DELETE /api/agents/:id` | rename (names are unique; agents address each other by name) and delete (storage and R2 objects) |
 | `GET /api/agents/:id/events` | SSE: `hello` with the transcript, `model_start`, `text_delta`, `model_done`, `progress` (tool starts and ends), `reply`, `activation` (tier, how, kind, bytes), `sys` (timers), `error` |
 | `POST /api/agents/:id/messages {text}` | a user turn |
 | `POST /api/agents/:id/signals {name, payload, afterMs}` | an external signal now, or at a Durable Object alarm after `afterMs` |
 | `/api/agents/:id/transcript`, `info`, `evict`, `reset` | Pi's entries from the journal; stats and sizes; drop the hot copy; delete the agent |
 | `POST /mcp/notes` | the notes MCP server (streamable HTTP) for outside clients |
 
-MCP servers are listed in `mcpFor()` in `demo.mjs`: `{ url }` for a remote streamable-HTTP server (optionally `tools: [...]` to expose a subset) or `{ handler }` for one hosted in the Worker. Tools reach the heap as `mcp__<server>__<tool>`.
+Built-in tools besides `fetch` and `now`: `list_agents` and `send_to_agent {agent, text}`, which delivers a `from:<sender>` signal into the other agent's mailbox through its object. MCP servers are listed in `mcpFor()` in `demo.mjs`: `{ url }` for a remote streamable-HTTP server (optionally `tools: [...]` to expose a subset) or `{ handler }` for one hosted in the Worker. Tools reach the heap as `mcp__<server>__<tool>`.
 
 ## 4. How it works
 
