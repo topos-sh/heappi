@@ -9,55 +9,6 @@
 
 A prototype, not a product. Benchmarked against Pi Durable on its own storage and against a transcript store; deployed as a demo on Cloudflare with a real model, MCP servers and agents that message each other.
 
-## Where it comes from
-
-| Source | What was taken |
-|---|---|
-| Smalltalk images | The idea: the program and its state are one file that resumes where it stopped. |
-| dquickts (Stencil Labs) | `JS_WriteSnapshot` / `JS_ReadSnapshot`, base plus delta format, `JS_RequestSuspend` at safepoints, the host-call pattern of a promise whose resolver lives in the heap. Forked; nothing pushed upstream yet. |
-| Pi Durable (Earendil Works) | Three uses: the vocabulary and discipline of the small benchmark harness (commit before anything is shown, tools as durable units, code mode as a nested call); the baseline, run as published; and the harness itself, embedded. |
-| [Infinity](https://infinity.hydro.run/) (Hydro, UC Berkeley) | The slice discipline: an execution never blocks on anything external. One FIFO per agent, stable event ids, dedup by sender sequence. |
-| [celld](https://celld.dev/) | A lease taken by a conditional write on object storage with epoch fencing; SQLite replicated to object storage as base plus increments. Became the R2 head object with `onlyIf` on its etag. |
-
-## How it differs
-
-The field makes agents durable in three ways: a journal of steps to replay (Temporal, Restate, DBOS, Cloudflare Workflows, Pi's code mode), a checkpoint of declared state at step boundaries (LangGraph, Infinity, Pi Durable turns, fx, Cloudflare Agents SDK), or a snapshot of a whole machine (E2B, Modal, Vercel Sandbox, CRIU). heappi stores an image of a language heap: it parks where a machine snapshot can, at the size a turn checkpoint has, with no replay. The price is that the checkpoint is an engine-specific binary rather than rows, so every engine or harness change needs a layer that stays deployable or a rebuild from the journal.
-
-## Mechanics
-
-**Activation.** Events from the mailbox go through `__deliver`; Pi's timers are pumped until nothing fires; `__drain` returns the outbox: host calls, mirrored Pi entries, progress records, replies. The checkpoint is written, then the calls are dispatched. Results come back as events. A model call, a tool call and a reply are three parks per step.
-
-**Chained checkpoints.** A checkpoint holds the cells that changed since the previous one, plus tombstones for freed cells. A chain is read in order onto its base. Checkpoints are HMAC'd; a tampered one is refused.
-
-**Layers and folds.** Two layers are built once per harness source and stored by content: the engine layer (natives only, 30 KB) and the harness layer (Pi evaluated, 1.6 MB). A new agent is a restore of the two, no eval. The engine keeps the harness layer as an *anchor*; a fold is a checkpoint relative to the anchor that replaces the chain, so the 1.6 MB layer stays shared forever and a fold with Pi inside is 48 to 139 KB. The writer folds when the chain outweighs the last fold or the last restore was slow.
-
-**Template restore.** One idle instance per harness version holds the layers. A restore clones its wasm memory (1.9 ms for 12 MB) and applies only the agent's checkpoints onto the live runtime: the engine resets the changed cells in place and reads them again. Full restore is the fallback. On Cloudflare the layers are keyed by the hash of the harness source and stored once in R2, because Pi's bundle does not evaluate to the same bytes in every isolate.
-
-**Code mode.** The `run` tool compiles the script in one of two script contexts inside the heap, with their own intrinsics. Only strings cross the boundary. `tools.<name>()` for every catalog tool including MCP and agent messaging, `remember()` and `mem[handle]` for working memory, `Promise.all` works, no nested scripts. A script awaiting a tool is parked with its frame. A script that never ends is terminated by the CPU budget after a grace period.
-
-**The readable shadow.** Every event and call is journaled with bodies interned by hash, and every committed Pi entry is mirrored. At every fold the host rebuilds the agent from the layers plus the journal in a scratch heap and compares a canonical hash. A journal missing one event hashes differently.
-
-## Benchmarks
-
-Same scenario on each system: 50 turns, each a model call, a script that fetches a 19 KB source and keeps it as working memory, a tool call, a reply. The model is scripted. Scripts in `baselines/`, raw numbers in `bench/out/`.
-
-| | heappi, Pi inside the heap | Pi Durable on its own SQLite storage | LangGraph with its SQLite checkpointer |
-|---|---|---|---|
-| Durability unit | heap checkpoint at any `await`, inside a script too | turn checkpoint; scripts replayed from a journal | state checkpoint after every graph node |
-| Disk after 50 turns | 2.6 MB, plus a 1.6 MB layer shared by all agents | 2.5 MB | 170 MB |
-| One durable write | 24 KB median, 53 KB max | entries and document revisions per step | the whole state, 0.7 to 1.4 MB |
-| Resume | 4 to 25 ms, depending on checkpoints since the last fold | 5 ms to open, 175 ms for the next turn | 15 ms to load, 93 ms for the next turn |
-| Time per turn | 108 ms, half of it a journal rebuild check at every fold | 115 ms | 47 ms |
-| Model context at turn 50 | 75 KB | 78 KB | 27 KB |
-
-Notes:
-
-- Pi on its own storage fails from turn 40: its code-mode `store()` caps at 1 MB of JSON, and the fetched sources fill it. Inside the heap the same data lives in handles with no cap.
-- LangGraph's SQLite checkpointer serializes the whole state at every superstep, 250 times here. Its Postgres checkpointer stores channels by version and would not. Its context is small because the payload sits in a state channel the model does not see.
-- heappi pays for four checkpoint-and-commit cycles per turn and for the rebuild check, which proves the journal is sufficient and would be sampled in production. Write amplification is the real cost: about 200 KB per turn with Pi inside, since every Pi step commits task, live and usage documents.
-- Wasm linear memory grows to about 30 MB per hot agent after 50 turns and never shrinks; the host evicts past a threshold and pays a warm restore. Parked agents cost nothing.
-- On Cloudflare: a hot turn is tens of milliseconds of work in the object, warm restore about 10 ms, cold restore from R2 300 to 500 ms, so R2 replication is batched after the response.
-
 ## Run it
 
 Locally, with a real model (Node 24):
@@ -84,6 +35,67 @@ One Durable Object per agent, R2 as the cold store, alarms for delayed signals. 
 
 `npm test` runs the checks; the benchmark scripts are in `bench/`, `baselines/` and `embed/`. Rebuilding the engine needs wasi-sdk 25 and the dquickts fork; the binary is committed.
 
+## How it differs
+
+The field makes agents durable in three ways: a journal of steps to replay (Temporal, Restate, DBOS, Cloudflare Workflows, Pi's code mode), a checkpoint of declared state at step boundaries (LangGraph, Infinity, Pi Durable turns, fx, Cloudflare Agents SDK), or a snapshot of a whole machine (E2B, Modal, Vercel Sandbox, CRIU). heappi stores an image of a language heap: it parks where a machine snapshot can, at the size a turn checkpoint has, with no replay. The price is that the checkpoint is an engine-specific binary rather than rows, so every engine or harness change needs a layer that stays deployable or a rebuild from the journal.
+
+## Benchmarks
+
+Same scenario on each system: 50 turns, each a model call, a script that fetches a 19 KB source and keeps it as working memory, a tool call, a reply. The model is scripted. Scripts in `baselines/`, raw numbers in `bench/out/`.
+
+| | heappi, Pi inside the heap | Pi Durable on its own SQLite storage | LangGraph with its SQLite checkpointer |
+|---|---|---|---|
+| Durability unit | heap checkpoint at any `await`, inside a script too | turn checkpoint; scripts replayed from a journal | state checkpoint after every graph node |
+| Disk after 50 turns | 2.6 MB, plus a 1.6 MB layer shared by all agents | 2.5 MB | 170 MB |
+| One durable write | 24 KB median, 53 KB max | entries and document revisions per step | the whole state, 0.7 to 1.4 MB |
+| Resume | 4 to 25 ms, depending on checkpoints since the last fold | 5 ms to open, 175 ms for the next turn | 15 ms to load, 93 ms for the next turn |
+| Time per turn | 108 ms, half of it a journal rebuild check at every fold | 115 ms | 47 ms |
+| Model context at turn 50 | 75 KB | 78 KB | 27 KB |
+
+Notes:
+
+- Pi on its own storage fails from turn 40: its code-mode `store()` caps at 1 MB of JSON, and the fetched sources fill it. Inside the heap the same data lives in handles with no cap.
+- LangGraph's SQLite checkpointer serializes the whole state at every superstep, 250 times here. Its Postgres checkpointer stores channels by version and would not. Its context is small because the payload sits in a state channel the model does not see.
+- heappi pays for four checkpoint-and-commit cycles per turn and for the rebuild check, which proves the journal is sufficient and would be sampled in production. Write amplification is the real cost: about 200 KB per turn with Pi inside, since every Pi step commits task, live and usage documents.
+- Wasm linear memory grows to about 30 MB per hot agent after 50 turns and never shrinks; the host evicts past a threshold and pays a warm restore. Parked agents cost nothing.
+- On Cloudflare: a hot turn is tens of milliseconds of work in the object, warm restore about 10 ms, cold restore from R2 300 to 500 ms, so R2 replication is batched after the response.
+
+## Where it comes from
+
+| Source | What was taken |
+|---|---|
+| Smalltalk images | The idea: the program and its state are one file that resumes where it stopped. |
+| dquickts (Stencil Labs) | `JS_WriteSnapshot` / `JS_ReadSnapshot`, base plus delta format, `JS_RequestSuspend` at safepoints, the host-call pattern of a promise whose resolver lives in the heap. Forked; nothing pushed upstream yet. |
+| Pi Durable (Earendil Works) | Three uses: the vocabulary and discipline of the small benchmark harness (commit before anything is shown, tools as durable units, code mode as a nested call); the baseline, run as published; and the harness itself, embedded. |
+| [Infinity](https://infinity.hydro.run/) (Hydro, UC Berkeley) | The slice discipline: an execution never blocks on anything external. One FIFO per agent, stable event ids, dedup by sender sequence. |
+| [celld](https://celld.dev/) | A lease taken by a conditional write on object storage with epoch fencing; SQLite replicated to object storage as base plus increments. Became the R2 head object with `onlyIf` on its etag. |
+
+## Map
+
+| Path | What |
+|---|---|
+| `engine/shim.c`, `engine/heappi.wasm` | The host contract: init, eval, call, resume, snapshot, restore, apply, anchor, CPU budget, memory limit, script contexts. |
+| `embed/` | Pi Durable in the heap: `prelude.js`, `pi-glue.js`, `build.sh`, the Pi-versus-small benchmark, the restore benchmark. |
+| `host/` | The Node cell: `engine.mjs`, `store.mjs` (SQLite, layers, HMAC, journal, mailbox), `cell.mjs` (activation, folds, templates, rebuild check, upgrade), `tests.mjs`. |
+| `cf/` | The Cloudflare Worker: `src/cell.mjs` the cell as a Durable Object, `src/demo.mjs` the demo on it, `src/gateway.mjs`, `src/mcp.mjs`. |
+| `app/` | The Node chat environment: pi-ai gateway, MCP clients, signals, the page shared with the Cloudflare demo. |
+| `heap/harness.js` | The small harness: 300 lines, same host contract, used by the benchmarks. |
+| `baselines/`, `bench/` | Pi Durable as published and a transcript store on the same scenario; the benchmark and its report. |
+
+## Mechanics
+
+**Activation.** Events from the mailbox go through `__deliver`; Pi's timers are pumped until nothing fires; `__drain` returns the outbox: host calls, mirrored Pi entries, progress records, replies. The checkpoint is written, then the calls are dispatched. Results come back as events. A model call, a tool call and a reply are three parks per step.
+
+**Chained checkpoints.** A checkpoint holds the cells that changed since the previous one, plus tombstones for freed cells. A chain is read in order onto its base. Checkpoints are HMAC'd; a tampered one is refused.
+
+**Layers and folds.** Two layers are built once per harness source and stored by content: the engine layer (natives only, 30 KB) and the harness layer (Pi evaluated, 1.6 MB). A new agent is a restore of the two, no eval. The engine keeps the harness layer as an *anchor*; a fold is a checkpoint relative to the anchor that replaces the chain, so the 1.6 MB layer stays shared forever and a fold with Pi inside is 48 to 139 KB. The writer folds when the chain outweighs the last fold or the last restore was slow.
+
+**Template restore.** One idle instance per harness version holds the layers. A restore clones its wasm memory (1.9 ms for 12 MB) and applies only the agent's checkpoints onto the live runtime: the engine resets the changed cells in place and reads them again. Full restore is the fallback. On Cloudflare the layers are keyed by the hash of the harness source and stored once in R2, because Pi's bundle does not evaluate to the same bytes in every isolate.
+
+**Code mode.** The `run` tool compiles the script in one of two script contexts inside the heap, with their own intrinsics. Only strings cross the boundary. `tools.<name>()` for every catalog tool including MCP and agent messaging, `remember()` and `mem[handle]` for working memory, `Promise.all` works, no nested scripts. A script awaiting a tool is parked with its frame. A script that never ends is terminated by the CPU budget after a grace period.
+
+**The readable shadow.** Every event and call is journaled with bodies interned by hash, and every committed Pi entry is mirrored. At every fold the host rebuilds the agent from the layers plus the journal in a scratch heap and compares a canonical hash. A journal missing one event hashes differently.
+
 ## Interfaces
 
 **The heap contract.** The host knows six globals the harness defines, strings in and out: `__deliver(eventJson)`, `__drain()` returning the outbox as JSON, `__stats()`, `__stateHash()` for the rebuild check, `__migrate()` after a harness upgrade, `__peek(handle)` for debugging. Events in: `{type:"user", text}`, `{type:"signal", name, payload}`, `{type:"config", config}`, `{type:"result", id, value | error}`. Outbox out: `{kind:"call", id, name:"model"|"tool", args}`, `{kind:"reply", turn, text}`, `progress`, `pi.entry`, `error`. A call is answered by a result event with the same id in a later activation; the heap keeps the pending promise, the host keeps nothing. Any harness that implements this runs in the cell; Pi does through `embed/pi-glue.js`, the small harness natively.
@@ -102,18 +114,6 @@ One Durable Object per agent, R2 as the cold store, alarms for delayed signals. 
 | `POST /mcp/notes` | the notes MCP server, for outside clients |
 
 **Adding a tool:** on Node, a case in the broker in `app/server.mjs`; on Cloudflare, in `DemoCell.broker` in `cf/src/demo.mjs`, plus a catalog entry with a JSON schema. **Adding an MCP server:** a line in `app/mcp.json` (stdio or streamable HTTP) or in `mcpFor()` in `cf/src/demo.mjs` (`{url}` or `{handler}`). Tools reach the heap as `mcp__<server>__<tool>`.
-
-## Map
-
-| Path | What |
-|---|---|
-| `engine/shim.c`, `engine/heappi.wasm` | The host contract: init, eval, call, resume, snapshot, restore, apply, anchor, CPU budget, memory limit, script contexts. |
-| `embed/` | Pi Durable in the heap: `prelude.js`, `pi-glue.js`, `build.sh`, the Pi-versus-small benchmark, the restore benchmark. |
-| `host/` | The Node cell: `engine.mjs`, `store.mjs` (SQLite, layers, HMAC, journal, mailbox), `cell.mjs` (activation, folds, templates, rebuild check, upgrade), `tests.mjs`. |
-| `cf/` | The Cloudflare Worker: `src/cell.mjs` the cell as a Durable Object, `src/demo.mjs` the demo on it, `src/gateway.mjs`, `src/mcp.mjs`. |
-| `app/` | The Node chat environment: pi-ai gateway, MCP clients, signals, the page shared with the Cloudflare demo. |
-| `heap/harness.js` | The small harness: 300 lines, same host contract, used by the benchmarks. |
-| `baselines/`, `bench/` | Pi Durable as published and a transcript store on the same scenario; the benchmark and its report. |
 
 ## Open problems
 
