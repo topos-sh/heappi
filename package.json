@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Prototype and benchmarks of the agent image architecture: one heap per agent on the dquickts-chain engine",
+  "license": "MIT",
   "scripts": {
     "build:engine": "./engine/build.sh",
     "smoke": "node --no-warnings host/smoke.mjs",
