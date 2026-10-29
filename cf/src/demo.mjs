@@ -48,7 +48,8 @@ function authorized(request, env) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const page = (html) => new Response(html, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "x-robots-tag": "noindex" } });
+    if (url.protocol === "http:" && url.hostname !== "localhost" && url.hostname !== "127.0.0.1") { url.protocol = "https:"; return Response.redirect(url.href, 308); } // never serve the page or take the token over plain HTTP
+    const page = (html) => new Response(html, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "x-robots-tag": "noindex", "strict-transport-security": "max-age=31536000", "referrer-policy": "no-referrer", "x-content-type-options": "nosniff" } });
     if (url.pathname === "/" || url.pathname === "/index.html") return page(authorized(request, env) ? UI : LOGIN); // nothing of the interface before the token
     if (url.pathname === "/api/login" && request.method === "POST") {
       const { token } = await request.json().catch(() => ({}));
