@@ -39,50 +39,36 @@ The field makes agents durable in three ways: a journal of steps to replay (Temp
 
 ## Benchmarks
 
-All numbers are from this repo's scripts on an M-series Mac, Node 24, 28 Oct 2026, except the Cloudflare rows. The scenario is a research agent: 50 turns, each a model call, a code-mode script that fetches a 19 KB source and keeps it as a handle, a tool call, a reply. The model is scripted so every system gives identical answers; all got 50 of 50.
+The same scenario on the closest systems from the list above, run from this repository on an M-series Mac, Node 24, 28 Oct 2026. The scenario is a research agent: 50 turns, each one a model call, a code-mode script (or the system's equivalent) that fetches a 19 KB source and keeps it as working memory, a tool call, a reply. The model is scripted, so every system should give identical answers, and the answers are checked. Systems that could not be run locally are marked.
 
-**Pi Durable inside the heap against the small harness** (`embed/pi-bench.mjs`). The small harness is `heap/harness.js`: 300 lines written here before Pi was embedded, implementing the same host contract with a conversation window, tools as functions, handles and code mode, and nothing else. It is the floor, what the image costs when the harness carries almost nothing:
+| | heappi, Pi inside the heap | Pi Durable 1.4 on its SQLite storage | LangGraph 1.5 + SqliteSaver | DBOS 5.4 on Postgres | Transcript store (SQLite) |
+|---|---|---|---|---|---|
+| Family | heap image | turn checkpoints, scripts replayed | state checkpoint per superstep | journal of steps, replay | conversation rows |
+| Where it can park | any `await`, inside a script | between turns | between graph nodes | between steps | between messages |
+| Correct turns | 50 / 50 | **39 / 50** | 50 / 50 | 50 / 50 | 50 / 50 |
+| Disk after 50 turns | 2.2 MB chain + 0.4 MB journal; 1.6 MB harness layer shared by all agents | 2.5 MB | **170 MB** | 1.4 MB of step outputs (1.5 MB on disk) | 1.5 MB kept, 64 KB if payloads are dropped |
+| One durable write | 24 KB median park, 53 KB max, 15 KB reply | document revisions and entries per step | the whole state: 674 KB median, 1.35 MB by turn 50 | the step's output, the payload once | one message row |
+| Resume after a restart | 4 ms through the template early on; 25 ms at turn 50 with 26 checkpoints since the last fold | 4.6 ms to open; next turn 175 ms | 15 ms to load the last checkpoint; next turn 93 ms | 1.1 s to launch and find the workflow, then 141 ms to replay 49 turns | one query |
+| Time per turn | 108 ms with a journal rebuild check at each of ten folds; about 60 ms without | 115 ms | 47 ms | 21 ms | 2.6 ms |
+| Model context at turn 50 | 75 KB | 78 KB | 27 KB | 26 KB | 1.49 MB kept, 33 KB dropped |
 
-| | Small harness | Pi Durable in the heap |
-|---|---|---|
-| Harness layer, stored once | 15 KB | 1.6 MB |
-| Checkpoint on a park, median / max | 2.3 / 29.7 KB | 24 / 53 KB |
-| Checkpoint on a reply | 0.4 KB | 15 KB |
-| Written per turn, folds included | 70 KB | 199 KB |
-| Live chain after 50 turns | 1.4 MB | 2.2 MB |
-| Journal | 110 KB | 361 KB |
-| Time per turn, rebuild check at every fold | 29 ms | 108 ms |
-| Warm restore, full chain at turn 50 | 13.5 ms, 62 deltas | 25.5 ms, 26 deltas, 3.8 MB |
-| Warm restore through the template, 8 turns in | 2.3 ms | 4 ms |
-| Engine heap | 2.3 MB | 5.7 MB |
-| Wasm linear memory after 50 turns | 15 MB | 29 MB |
-| Model context, last request | 5 KB | 73 KB |
+What the table says, honestly:
 
-Pi costs about twice the disk, ten times the checkpoint bytes and three and a half times the time of the small harness, because every Pi step commits task, live and usage documents that the delta carries, and because Pi sends its whole transcript to the model where the small harness keeps a window. In return it is a complete harness.
+- **Pi Durable on its own storage answered wrong from turn 40**, in the earlier benchmark too. Pi's `store()` for script data is capped at 1 MB of JSON; 40 sources fill it, every later script throws, and the answer becomes -1. The earlier benchmark only checked the image's answers and reported Pi as correct; that was wrong. Inside the heap, Pi's data lives in heappi's handles, which have no such cap.
+- **LangGraph's SQLite checkpointer writes the whole state at every superstep**, 250 times for 50 turns, which is where 170 MB comes from. The payload sits in a state channel the model does not see, so its context is small; the cost moved to disk. The Postgres checkpointer stores channel values by version and would not rewrite unchanged channels; the SQLite one does.
+- **DBOS is the cheapest per turn and the smallest on disk** because it journals only step outputs and keeps the agent's state in workflow memory. The price is in the resume: a restart replays every step from the journal, and the workflow code between steps must be deterministic. Replay here is fast because the steps are cheap stubs; the time grows with history.
+- **The transcript store wins on speed** because it only appends rows. It either sends the model 1.5 MB per request or forgets what it fetched.
+- **heappi is in the middle on disk and slow per turn** because a turn is four checkpoint-and-commit cycles, and because the rebuild check runs at every fold here to prove the journal is sufficient; production would sample. What it alone does is the first row: it parks anywhere, with the script's stack, and the model context stays flat without dropping the data.
+- Pi Durable and heappi send the model the full transcript; LangGraph and DBOS send the messages without the payload for the same reason heappi does, by reference. The transcript numbers are the ends of the range.
+- **Not measured:** Infinity (no public runtime), Temporal and Restate (need their servers; same family as DBOS), Cloudflare Workflows and Agents SDK (the Agents SDK stores state as rows in the object's SQLite, the transcript store's shape), and microVM snapshots (E2B, Modal, Vercel Sandbox: a snapshot is the guest memory, hundreds of MB, and restore is hundreds of milliseconds to seconds per the vendors' documentation).
 
-**Against the other ways of storing the same agent** (image with the small harness, `bench/run.mjs`, measured before the anchored folds):
+**Cloudflare** (Durable Object in SJC, R2 in WNAM, `cf/bench.mjs`): a hot turn with four parks is about 50 ms of work and 150 ms at the client including a 73 ms round trip; warm restore from the object's SQLite about 10 ms above the round trip; cold restore from R2 300 to 500 ms; one R2 operation from the object costs 100 to 500 ms, so replication is batched after the response. In-object CPU timings read zero because Workers freeze the clock.
 
-| | Disk per agent | Model context, last request | Time per turn |
-|---|---|---|---|
-| Agent image | 1.52 MB | 5 KB | 32 ms, four parks and commits |
-| Pi Durable on its own SQLite storage | 2.34 MB | whole transcript | 115 ms |
-| Transcript store, payloads kept | 1.54 MB | 1.49 MB | 2.6 ms |
-| Transcript store, payloads dropped | 64 KB | 33 KB | 0.4 ms |
+**Memory**: a hot heappi agent with Pi inside holds 5.7 MB of engine heap in 29 MB of wasm linear memory after 50 turns, because linear memory grows for snapshot buffers and never shrinks; the host drops the hot copy past a threshold and pays a warm restore. A parked agent is zero. A Pi Durable harness process open and idle is 62 MB, shared by many conversations in practice.
 
-The image holds the same information as the transcript that keeps its data, in the same space, and sends the model 300 times less. The transcript store is faster per turn because it only appends; the image pays for four snapshot-and-commit cycles, and half of its 32 ms is the rebuild check at every fold, which production would sample.
+**Other costs:** 204 KB written per turn with Pi inside for a few KB of real change, because every Pi step commits task, live and usage documents that the delta carries; the fold cadence is the lever and it trades against restore latency. QuickJS is an interpreter, an order of magnitude or more behind V8; scripts are glue and heavy work is a tool. On Cloudflare each agent also keeps a 1.7 MB copy of the layers in its own SQLite so that a full restore needs no R2 read.
 
-**Memory** (40 agents, 10 turns each): a hot image is 2.7 MB RSS, almost all wasm linear memory; the same loop in a `node:vm` context is 0.9 MB of V8 heap before the cost of a real isolate; a Pi Durable harness process open and idle is 62 MB, shared by many conversations in practice. A parked image is 0.
-
-**Cloudflare** (Durable Object in SJC, R2 in WNAM, image with the small harness, `cf/bench.mjs`): a hot turn with four parks is about 50 ms of work and 150 ms at the client including a 73 ms round trip; warm restore from the object's SQLite about 10 ms above the round trip; cold restore from R2 300 to 500 ms; one R2 operation from the object costs 100 to 500 ms, so replication is batched after the response. The demo with Pi inside and a real model: creating an agent 3.9 s the first time (layers built and put to R2 once), template restore after eviction with two checkpoints applied, a 37 KB MCP result filtered inside a script and passed to another tool while the model received 25 characters.
-
-**What is not good:**
-
-- Write amplification: 199 KB per turn with Pi inside for a few KB of real change. The fold cadence is the lever and it trades against restore latency.
-- Wasm linear memory grows and never shrinks: 29 MB after 50 turns. The host drops the hot copy past a threshold and pays a warm restore.
-- QuickJS is an interpreter, an order of magnitude or more behind V8. Scripts are glue; heavy work is a tool.
-- In-object timings on Workers read zero for CPU work because the clock is frozen; the Cloudflare numbers are client-side.
-- Each agent on Cloudflare also keeps a 1.7 MB copy of the layers in its own SQLite so a full restore needs no R2 read.
-- The rebuild check is run at every fold here, which halves turn throughput; it exists to prove the journal is sufficient, not to run in production at that rate.
+Scripts: `node embed/pi-bench.mjs` (heappi), `node baselines/pi-resume.mjs` (Pi), `node baselines/langgraph.mjs` (LangGraph), `DBOS_SYSTEM_DATABASE_URL=postgresql://... node baselines/dbos.mjs` (DBOS, needs a Postgres), `node bench/run.mjs` (transcript store and the memory table). Raw outputs are in `bench/out/` and `embed/out/`; every number above is in
 
 ## Run it
 

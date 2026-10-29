@@ -25,8 +25,10 @@ return { above50: r.items.filter(i => i.score > 50).length };`;
 }
 
 /** the scripted model as a faux response factory: looks only at the last message */
+export const piMarks = { lastContextBytes: 0, modelCalls: 0 };
 function respond(context) {
   const msgs = context.messages;
+  piMarks.modelCalls++; piMarks.lastContextBytes = JSON.stringify({ systemPrompt: context.systemPrompt, messages: msgs, tools: context.tools?.map((t) => t.name) }).length;
   const last = msgs[msgs.length - 1];
   if (last.role === "user") {
     const text = typeof last.content === "string" ? last.content : last.content.map((c) => c.text ?? "").join("");
