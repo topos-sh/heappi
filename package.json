@@ -11,7 +11,10 @@
     "demo": "node --no-warnings host/demo.mjs 3",
     "bench": "node --no-warnings bench/run.mjs",
     "test": "node --no-warnings host/tests.mjs",
-    "cf:sync": "./cf/sync.sh"
+    "cf:sync": "./cf/sync.sh",
+    "build:harness": "./embed/build.sh",
+    "app": "npm run -s build:harness && node --no-warnings app/server.mjs",
+    "app:demo": "npm run -s build:harness && node --no-warnings app/server.mjs --demo"
   },
   "devDependencies": {
     "@earendil-works/chord": "1.4.0",

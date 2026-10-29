@@ -1,6 +1,6 @@
 # Using heappi
 
-How to run the prototype, what its interfaces are, and how the pieces fit. The [README](README.md) has the design summary and the benchmark results; this file is the operator's and integrator's view.
+How to run the prototype, what its interfaces are, and how the pieces fit. The [README](README.md) says what heappi is and how to try it; this file is the operator's and integrator's view.
 
 ## 1. Prerequisites and quick start
 
