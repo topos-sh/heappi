@@ -64,12 +64,7 @@ const $ = (id) => document.getElementById(id);
 let current = null, es = null, streaming = null, lastStreamed = "";
 async function api(path, opts) {
   let r = await fetch("/api/agents" + path, opts);
-  if (r.status === 401) { // the Cloudflare demo asks for its token once; the cookie keeps it
-    const token = prompt("This demo needs its access token (HEAPPI_DEMO_TOKEN):");
-    if (!token) throw new Error("no token");
-    await fetch("/api/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token }) });
-    r = await fetch("/api/agents" + path, opts);
-  }
+  if (r.status === 401) { location.replace("/"); throw new Error("not signed in"); } // the Cloudflare demo: back to its login page
   return r.json();
 }
 function el(cls, text) { const d = document.createElement("div"); d.className = cls; d.textContent = text; $("log").appendChild(d); $("log").scrollTop = $("log").scrollHeight; return d; }

@@ -16,6 +16,7 @@
 import { DurableObject } from "cloudflare:workers";
 import PI_HARNESS from "./pi-harness.txt";
 import UI from "./ui.html";
+import LOGIN from "./login.html";
 import INSTRUCTIONS from "./instructions.txt";
 import { CellBase, fnv } from "./cell.mjs";
 import { getGateway } from "./gateway.mjs";
@@ -47,13 +48,14 @@ function authorized(request, env) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (url.pathname === "/" || url.pathname === "/index.html") return new Response(UI, { headers: { "content-type": "text/html; charset=utf-8" } });
+    const page = (html) => new Response(html, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "x-robots-tag": "noindex" } });
+    if (url.pathname === "/" || url.pathname === "/index.html") return page(authorized(request, env) ? UI : LOGIN); // nothing of the interface before the token
     if (url.pathname === "/api/login" && request.method === "POST") {
       const { token } = await request.json().catch(() => ({}));
       if (env.DEMO_TOKEN && token !== env.DEMO_TOKEN) return json({ error: "wrong token" }, 401);
       return json({ ok: true }, 200, { "set-cookie": `heappi=${token ?? ""}; Path=/; HttpOnly; SameSite=Lax${url.protocol === "https:" ? "; Secure" : ""}; Max-Age=2592000` });
     }
-    if (!authorized(request, env)) return json({ error: "unauthorized", login: "POST /api/login {token}" }, 401);
+    if (!authorized(request, env)) return json({ error: "unauthorized" }, 401);
     if (url.pathname === "/mcp/notes") return notesServer(env.COLD)(request);
     const m = /^\/api\/agents(?:\/([\w-]+))?(?:\/(\w+))?$/.exec(url.pathname);
     if (!m) return json({ error: "not found" }, 404);
