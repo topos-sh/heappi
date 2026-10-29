@@ -41,7 +41,7 @@ The field makes agents durable in three ways: a journal of steps to replay (Temp
 
 All numbers are from this repo's scripts on an M-series Mac, Node 24, 28 Oct 2026, except the Cloudflare rows. The scenario is a research agent: 50 turns, each a model call, a code-mode script that fetches a 19 KB source and keeps it as a handle, a tool call, a reply. The model is scripted so every system gives identical answers; all got 50 of 50.
 
-**Pi Durable inside the heap against the small harness** (`embed/pi-bench.mjs`):
+**Pi Durable inside the heap against the small harness** (`embed/pi-bench.mjs`). The small harness is `heap/harness.js`: 300 lines written here before Pi was embedded, implementing the same host contract with a conversation window, tools as functions, handles and code mode, and nothing else. It is the floor, what the image costs when the harness carries almost nothing:
 
 | | Small harness | Pi Durable in the heap |
 |---|---|---|
@@ -60,7 +60,7 @@ All numbers are from this repo's scripts on an M-series Mac, Node 24, 28 Oct 202
 
 Pi costs about twice the disk, ten times the checkpoint bytes and three and a half times the time of the small harness, because every Pi step commits task, live and usage documents that the delta carries, and because Pi sends its whole transcript to the model where the small harness keeps a window. In return it is a complete harness.
 
-**Against the other ways of storing the same agent** (small harness, `bench/run.mjs`, before the anchored folds):
+**Against the other ways of storing the same agent** (image with the small harness, `bench/run.mjs`, measured before the anchored folds):
 
 | | Disk per agent | Model context, last request | Time per turn |
 |---|---|---|---|
@@ -73,7 +73,7 @@ The image holds the same information as the transcript that keeps its data, in t
 
 **Memory** (40 agents, 10 turns each): a hot image is 2.7 MB RSS, almost all wasm linear memory; the same loop in a `node:vm` context is 0.9 MB of V8 heap before the cost of a real isolate; a Pi Durable harness process open and idle is 62 MB, shared by many conversations in practice. A parked image is 0.
 
-**Cloudflare** (Durable Object in SJC, R2 in WNAM, small harness, `cf/bench.mjs`): a hot turn with four parks is about 50 ms of work and 150 ms at the client including a 73 ms round trip; warm restore from the object's SQLite about 10 ms above the round trip; cold restore from R2 300 to 500 ms; one R2 operation from the object costs 100 to 500 ms, so replication is batched after the response. The demo with Pi inside and a real model: creating an agent 3.9 s the first time (layers built and put to R2 once), template restore after eviction with two checkpoints applied, a 37 KB MCP result filtered inside a script and passed to another tool while the model received 25 characters.
+**Cloudflare** (Durable Object in SJC, R2 in WNAM, image with the small harness, `cf/bench.mjs`): a hot turn with four parks is about 50 ms of work and 150 ms at the client including a 73 ms round trip; warm restore from the object's SQLite about 10 ms above the round trip; cold restore from R2 300 to 500 ms; one R2 operation from the object costs 100 to 500 ms, so replication is batched after the response. The demo with Pi inside and a real model: creating an agent 3.9 s the first time (layers built and put to R2 once), template restore after eviction with two checkpoints applied, a 37 KB MCP result filtered inside a script and passed to another tool while the model received 25 characters.
 
 **What is not good:**
 
