@@ -2,7 +2,6 @@ node_modules/
 *.sqlite
 *.sqlite-*
 cf/src/heappi.wasm
-cf/src/harness.txt
 cf/src/pi-harness.txt
 cf/src/ui.html
 cf/.dev.vars

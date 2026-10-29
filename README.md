@@ -56,7 +56,7 @@ Notes:
 - LangGraph's SQLite checkpointer serializes the whole state at every superstep, 250 times here. Its Postgres checkpointer stores channels by version and would not. Its context is small because the payload sits in a state channel the model does not see.
 - heappi pays for four checkpoint-and-commit cycles per turn and for the rebuild check, which proves the journal is sufficient and would be sampled in production. Write amplification is the real cost: about 200 KB per turn with Pi inside, since every Pi step commits task, live and usage documents.
 - Wasm linear memory grows to about 30 MB per hot agent after 50 turns and never shrinks; the host evicts past a threshold and pays a warm restore. Parked agents cost nothing.
-- On Cloudflare: a hot turn is about 50 ms of work in the object, warm restore about 10 ms, cold restore from R2 300 to 500 ms, so R2 replication is batched after the response.
+- On Cloudflare: a hot turn is tens of milliseconds of work in the object, warm restore about 10 ms, cold restore from R2 300 to 500 ms, so R2 replication is batched after the response.
 
 ## Run it
 
@@ -74,10 +74,10 @@ On Cloudflare:
 
 ```bash
 ./cf/sync.sh
-npx wrangler@4 r2 bucket create <bucket>     # then name it in cf/wrangler.demo.jsonc
-npx wrangler@4 deploy --config cf/wrangler.demo.jsonc
-npx wrangler@4 secret put ANTHROPIC_API_KEY --config cf/wrangler.demo.jsonc
-npx wrangler@4 secret put DEMO_TOKEN --config cf/wrangler.demo.jsonc     # the page asks for it once
+npx wrangler@4 r2 bucket create <bucket>     # then name it in cf/wrangler.jsonc
+npx wrangler@4 deploy --config cf/wrangler.jsonc
+npx wrangler@4 secret put ANTHROPIC_API_KEY --config cf/wrangler.jsonc
+npx wrangler@4 secret put DEMO_TOKEN --config cf/wrangler.jsonc     # the page asks for it once
 ```
 
 One Durable Object per agent, R2 as the cold store, alarms for delayed signals. Tools in the demo: `fetch`, `now`, `run`, `list_agents`, `send_to_agent`, a notes MCP server hosted in the Worker over R2, and the public Cloudflare docs and DeepWiki MCP servers.
@@ -91,7 +91,7 @@ One Durable Object per agent, R2 as the cold store, alarms for delayed signals. 
 | `engine/shim.c`, `engine/heappi.wasm` | The host contract: init, eval, call, resume, snapshot, restore, apply, anchor, CPU budget, memory limit, script contexts. |
 | `embed/` | Pi Durable in the heap: `prelude.js`, `pi-glue.js`, `build.sh`, the Pi-versus-small benchmark, the restore benchmark. |
 | `host/` | The Node cell: `engine.mjs`, `store.mjs` (SQLite, layers, HMAC, journal, mailbox), `cell.mjs` (activation, folds, templates, rebuild check, upgrade), `tests.mjs`. |
-| `cf/` | `src/cell.mjs` the Durable Object base, `src/demo.mjs` the demo Worker, `src/index.mjs` the benchmark Worker, `bench.mjs`. |
+| `cf/` | The Cloudflare Worker: `src/cell.mjs` the cell as a Durable Object, `src/demo.mjs` the demo on it, `src/gateway.mjs`, `src/mcp.mjs`. |
 | `app/` | The Node chat environment: pi-ai gateway, MCP clients, signals, the page shared with the Cloudflare demo. |
 | `heap/harness.js` | The small harness: 300 lines, same host contract, used by the benchmarks. |
 | `baselines/`, `bench/` | Pi Durable as published and a transcript store on the same scenario; the benchmark and its report. |

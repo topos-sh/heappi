@@ -7,7 +7,7 @@ How to run the prototype, what its interfaces are, and how the pieces fit. The [
 - Node 24 (uses `node:sqlite`; `node:wasi` is not needed).
 - Nothing else to run what is committed: the engine binary `engine/heappi.wasm` is in the repo.
 - To rebuild the engine: a wasi-sdk (25 was used) and the engine fork at `../dquickts-chain`.
-- To run the Cloudflare cell: `wrangler` 4 (fetched by `npx`), a Cloudflare account with an R2 bucket named in `cf/wrangler.jsonc`.
+- To run the Cloudflare demo: `wrangler` 4 (fetched by `npx`), a Cloudflare account with an R2 bucket named in `cf/wrangler.jsonc`.
 
 ```bash
 npm install                 # Pi Durable and pi-ai, used only by the baselines
@@ -151,29 +151,21 @@ cell.metrics; cell.rebuilds;               // every activation and every rebuild
 
 The broker is anything with `call(agentId, callId, name, args) → Promise<value>` and an optional `settle()` the driver can await; it must answer by enqueueing a `result` event, which `Cell` does for it. `host/broker.mjs` is the in-process one with the scripted model and the content-keyed completion cache.
 
-### 3.9 The Cloudflare cell (`cf/`)
+### 3.9 The Cloudflare cell and demo (`cf/`)
 
 ```bash
-./cf/sync.sh                                         # copy engine and harness into cf/src
-npx wrangler@4 dev --config cf/wrangler.jsonc --local
+./cf/sync.sh                                                   # engine, Pi harness and the page into cf/src
+grep '^ANTHROPIC_API_KEY=' .env > cf/.dev.vars                 # local secrets (git-ignored)
+npx wrangler@4 dev --config cf/wrangler.jsonc --local --var MODEL:scripted   # keyless check with the scripted model
+npx wrangler@4 dev --config cf/wrangler.jsonc --local                        # real model locally
 npx wrangler@4 deploy --config cf/wrangler.jsonc
-node cf/bench.mjs https://<worker-url> --turns 30 --label remote --agent a1 [--rep sync]
+npx wrangler@4 secret put ANTHROPIC_API_KEY --config cf/wrangler.jsonc
+npx wrangler@4 secret put DEMO_TOKEN --config cf/wrangler.jsonc
 ```
 
-One Durable Object per agent, keyed by name. Endpoints under `/agents/:id/`:
+`cf/src/cell.mjs` is the cell as a Durable Object base class: one object per agent, the hot tier its engine instance, the warm tier its SQLite (`head` with the layer key, `checkpoints` and `blobs` chunked under 2 MB with the engine layer at seq -2 and the harness layer at seq -1, `journal`, `messages`), the cold tier R2 (`layers/<key>-engine.bin` and `-harness.bin` once per harness source, `<prefix>/<id>/<seq>-<kind>.bin` and `<prefix>/<id>/head` written by conditional put). The layers are keyed by the hash of the harness source and loaded from R2 by every isolate, so the template built from them matches the checkpoints any isolate wrote; a restore clones the template and applies the agent's checkpoints, with a full restore as fallback; folds are relative to the harness layer. In-object timings read zero for pure CPU because Workers freeze the clock.
 
-| Path | Does |
-|---|---|
-| `create` | reset, restore nothing, boot the harness, write the base, replicate |
-| `turn?t=N&tier=hot|warm|cold&rep=async|sync` | run one user turn: activations until a reply; `tier` applies to the first load; `rep=sync` replicates on the commit path |
-| `restore?tier=warm|cold` | drop the hot copy and restore, with timings |
-| `info` | head, chain bytes, DB size, hot or not, replication counts |
-| `r2ping` | raw R2 latencies from the object |
-| `reset` | delete storage and R2 objects for the agent |
-
-The object's SQLite holds `head` (with the layer key), `checkpoints` and `blobs` (chunked under 2 MB; the engine layer at seq -2 and the harness layer at seq -1, the agent's fold and checkpoints from seq 1), `journal`, `messages`. R2 holds `layers/<key>-engine.bin` and `layers/<key>-harness.bin` once per harness source, `agents/<id>/<seq>-<kind>.bin` and `agents/<id>/head` (the key list, layers first), written by conditional put. In-object timings read zero for pure CPU because Workers freeze the clock; time from the client.
-
-### 3.10 The Cloudflare demo (`cf/wrangler.demo.jsonc`, `cf/src/demo.mjs`)
+`cf/src/demo.mjs` puts Pi Durable inside it, with a real model, MCP servers, alarms, SSE and the chat page. Secrets: `ANTHROPIC_API_KEY` and `DEMO_TOKEN`; locally `cf/.dev.vars`. `MODEL` is a var (`claude-sonnet-5-5`; `scripted` runs the research scenario's model without a key). Every request needs the token: the page posts it once to `/api/login` and keeps a cookie; scripts send `Authorization: Bearer <token>`.
 
 The same cell with Pi Durable inside, a real model, MCP servers, alarms, SSE and the chat page, deployed as `heappi-demo`. Secrets: `ANTHROPIC_API_KEY` and `DEMO_TOKEN` (`wrangler secret put`); locally `cf/.dev.vars`. `MODEL` is a var (`claude-sonnet-5-5`; `scripted` runs the research scenario's model without a key). Every request needs the token: the page posts it once to `/api/login` and keeps a cookie; scripts send `Authorization: Bearer <token>` or `?token=`.
 
@@ -215,7 +207,7 @@ Built-in tools besides `fetch` and `now`: `list_agents` and `send_to_agent {agen
 
 - **The harness** is the product surface. Edit `heap/harness.js`; bump `HARNESS_VERSION`; put shape changes in `__migrate`. Keep state on `__agent`, keep every external effect a `hostCall`, and keep the state a function of the events, or the rebuild check will tell you.
 - **The engine contract** is `engine/shim.c`; a change there needs a rebuild and makes old snapshots unloadable, so bump the layer by rebuilding and let agents rebuild from their journals.
-- **A new host** needs: the five WASI imports, the C exports, a store with fenced commits, and a broker that answers calls with events. `cf/src/index.mjs` is the second host and is 300 lines.
+- **A new host** needs: the five WASI imports, the C exports, a store with fenced commits, and a broker that answers calls with events. `cf/src/cell.mjs` is the second host.
 
 ## 6. Known limits
 

@@ -4,7 +4,7 @@
 // server-sent events, and the chat page. One Durable Object per agent
 // (DemoCell), one for the list of agents (AgentIndex).
 //
-//   /                          the chat page
+//   /                          the chat page (the login card without the token)
 //   POST /api/login {token}    sets the cookie the page uses (DEMO_TOKEN secret)
 //   GET  /api/agents           agents, model, tool catalog
 //   POST /api/agents {id?}     create an agent

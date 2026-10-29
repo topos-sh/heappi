@@ -1,16 +1,21 @@
 {
-  "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "agent-image-test",
-  "main": "src/index.mjs",
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "heappi-demo",
+  "main": "src/demo.mjs",
   "compatibility_date": "2025-10-01",
+  "compatibility_flags": ["nodejs_compat"],
   "rules": [
     { "type": "CompiledWasm", "globs": ["**/*.wasm"] },
-    { "type": "Text", "globs": ["**/*.txt"] }
+    { "type": "Text", "globs": ["**/*.txt", "**/*.html"] }
   ],
   "durable_objects": {
-    "bindings": [{ "name": "CELL", "class_name": "AgentCell" }]
+    "bindings": [
+      { "name": "CELL", "class_name": "DemoCell" },
+      { "name": "INDEX", "class_name": "AgentIndex" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AgentCell"] }],
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["DemoCell", "AgentIndex"] }],
   "r2_buckets": [{ "binding": "COLD", "bucket_name": "agent-image-cold" }],
+  "vars": { "MODEL": "claude-sonnet-5-5" },
   "observability": { "enabled": true }
 }

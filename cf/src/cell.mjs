@@ -1,4 +1,5 @@
-// The cell as a Durable Object, harness agnostic: one object per agent.
+// The cell as a Durable Object, harness agnostic: one object per agent;
+// demo.mjs puts Pi Durable inside it.
 //   hot   the engine instance kept in the object's memory between requests
 //   warm  the object's SQLite (layers, checkpoints, journal, head)
 //   cold  R2: the layers once by hash, the agent's fold and checkpoints, and
