@@ -2,7 +2,7 @@
 
 **[Pi Durable](https://github.com/earendil-works/pi/tree/main/packages/durable) running unchanged inside a snapshottable QuickJS heap. The heap is the agent; chained heap checkpoints are the durability.**
 
-- **Engine:** [dquickts](https://github.com/stencil-hq/dquickts), a QuickJS fork with heap snapshots and safepoint suspension, plus seven patches from this project: chained checkpoints (deltas against a base), tombstones, folds relative to an anchor layer, and applying checkpoints onto a live runtime. Compiled to a wasm32-wasi reactor, 1.7 MB.
+- **Engine:** [dquickts](https://github.com/stencil-hq/dquickts), a QuickJS fork with heap snapshots and safepoint suspension, plus seven patches from this project (`engine/patches/`): chained checkpoints (deltas against a base), tombstones, folds relative to an anchor layer, and applying checkpoints onto a live runtime. Compiled to a wasm32-wasi reactor, 1.7 MB.
 - **Harness:** `@earendil-works/pi-durable` 1.4.0 bundled with esbuild (minified, 413 KB of source), evaluated inside the heap on a 20-line web-platform prelude and 150 lines of glue. Its model calls and tool calls go out as host calls; its `MemoryStorage` lives in the heap and is what the checkpoint carries. Pi's own replay journal and task graph ride along unused.
 - **Host:** an engine, a lease and a journal. It delivers events, runs the heap until everything is parked on a host call, commits one checkpoint plus journal rows in one transaction, and emits the calls. It never parses agent state. Two hosts: Node with SQLite, and a Cloudflare Durable Object per agent with R2 as the cold store.
 - **What that buys:** a park at any `await`, including inside a running script, in 2 to 25 KB; a restore in a few milliseconds on any machine with the same engine build; working memory as handles the model refers to without seeing; no replay and no determinism rule; an idle agent that is storage only.
@@ -33,7 +33,7 @@ npx wrangler@4 secret put DEMO_TOKEN --config cf/wrangler.jsonc     # the page a
 
 One Durable Object per agent, R2 as the cold store, alarms for delayed signals. Tools in the demo: `fetch`, `now`, `run`, `list_agents`, `send_to_agent`, a notes MCP server hosted in the Worker over R2, and the public Cloudflare docs and DeepWiki MCP servers.
 
-`npm test` runs the checks; the benchmark scripts are in `bench/`, `baselines/` and `embed/`. Rebuilding the engine needs wasi-sdk 25 and the dquickts fork; the binary is committed.
+`npm test` runs the checks; the benchmark scripts are in `bench/`, `baselines/` and `embed/`. Rebuilding the engine needs wasi-sdk 25 and dquickts with the seven patches in `engine/patches/` (instructions there); the binary is committed.
 
 ## How it differs
 

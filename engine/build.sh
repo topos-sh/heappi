@@ -1,8 +1,8 @@
 #!/bin/sh
-# Build the engine (dquickts-chain, branch chained-checkpoints) plus the host
-# shim as a wasm32-wasi reactor module: engine/heappi.wasm
+# Build the engine (dquickts f9a3efa with engine/patches/ applied) plus the
+# host shim as a wasm32-wasi reactor module: engine/heappi.wasm
 #
-#   ENGINE=../dquickts-chain WASI_SDK=/path/to/wasi-sdk ./engine/build.sh
+#   ENGINE=../dquickts WASI_SDK=/path/to/wasi-sdk ./engine/build.sh
 set -e
 cd "$(dirname "$0")"
 ENGINE="${ENGINE:-../../dquickts-chain}"

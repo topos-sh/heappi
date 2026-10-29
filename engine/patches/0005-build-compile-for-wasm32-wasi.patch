@@ -1,0 +1,49 @@
+From a44c10b6a9f15ea8470ee992ef010fc8dee279ab Mon Sep 17 00:00:00 2001
+From: heappi <heappi@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 21:08:45 -0700
+Subject: [PATCH 5/7] build: compile for wasm32-wasi
+
+Atomics (pthread) and the C stack check are not available under WASI,
+as under Emscripten. dtoa.c included setjmp.h without using it, which
+wasi-libc rejects. With this, the engine and the snapshot hosts build
+with wasi-sdk (clang --target=wasm32-wasi) and run under Node's WASI.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ dtoa.c    | 1 -
+ quickjs.c | 4 ++--
+ 2 files changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/dtoa.c b/dtoa.c
+index ac1be8d..353940e 100644
+--- a/dtoa.c
++++ b/dtoa.c
+@@ -30,7 +30,6 @@
+ #include <ctype.h>
+ #include <sys/time.h>
+ #include <math.h>
+-#include <setjmp.h>
+ 
+ #include "cutils.h"
+ #include "dtoa.h"
+diff --git a/quickjs.c b/quickjs.c
+index fc2e52d..7025564 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -68,11 +68,11 @@
+ 
+ /* define to include Atomics.* operations which depend on the OS
+    threads */
+-#if !defined(__EMSCRIPTEN__)
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+ #define CONFIG_ATOMICS
+ #endif
+ 
+-#if !defined(__EMSCRIPTEN__)
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+ /* enable stack limitation */
+ #define CONFIG_STACK_CHECK
+ #endif
+-- 
+2.54.0 (Apple Git-157)
+

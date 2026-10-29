@@ -1,0 +1,772 @@
+From 2c7bea9cc20f13fdedff03e513cfb87f3eef0edc Mon Sep 17 00:00:00 2001
+From: heappi <heappi@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 21:07:24 -0700
+Subject: [PATCH 1/7] snapshot: chained checkpoints
+
+JS_SNAPSHOT_CHAIN writes a delta of the current base and then makes the
+state it describes the new base of the runtime, so the next checkpoint
+only holds what changed since this one. The header of a checkpoint
+carries the id of the state it applies to and its own id is the hash of
+its bytes, so the ids form a chain.
+
+JS_ReadSnapshotChain() applies a sequence of checkpoints on top of a
+base: the cells, atoms and strings of each one are numbered after the
+previous ones, bodies are folded (a patch applies to the body left by
+the previous checkpoint) and only then read. It rejects a missing,
+reordered or plain delta inside the chain. When the last delta is a
+chained checkpoint, the restored state is attached as the base, so the
+restored runtime continues the chain. JS_ReadSnapshot() is now a
+wrapper, and JS_GetSnapshotBaseId() gives the host the id to store with
+a checkpoint.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ Changelog          |   4 +
+ README.md          |  10 ++
+ quickjs-snapshot.c | 381 +++++++++++++++++++++++++++++++++++----------
+ quickjs.h          |  22 ++-
+ 4 files changed, 334 insertions(+), 83 deletions(-)
+
+diff --git a/Changelog b/Changelog
+index 48c52cd..adf0d5d 100644
+--- a/Changelog
++++ b/Changelog
+@@ -8,6 +8,10 @@ unreleased:
+ - added incremental snapshots (JS_SNAPSHOT_BASE, JS_SNAPSHOT_DELTA): a
+   delta only contains the changes since a base snapshot; a modified
+   object is saved as a patch of its base version
++- added chained checkpoints (JS_SNAPSHOT_CHAIN, JS_ReadSnapshotChain(),
++  JS_GetSnapshotBaseId()): a checkpoint only contains the changes since
++  the previous checkpoint, and the restored state is the base of the
++  next one
+ - a base snapshot is reproducible (the Math.random() state is saved in
+   full snapshots and deltas, not in bases): a host can rebuild it
+   instead of storing it
+diff --git a/README.md b/README.md
+index 2ea28e3..56549e0 100644
+--- a/README.md
++++ b/README.md
+@@ -305,6 +305,16 @@ Deltas are not chained: each delta needs only the base. A runtime restored from
+ base attached, so the deltas it writes are relative to the same base. Many runtimes can share
+ one base.
+ 
++**Chained checkpoints.** A delta grows with everything that changed since the base. To store
++only what changed since the *previous* save, write with `JS_SNAPSHOT_CHAIN` instead: the
++checkpoint is a delta of the current base, and the state it describes then becomes the new base
++of the runtime. Each checkpoint records the id of the state it applies to, so the ids form a
++chain. `JS_ReadSnapshotChain(rt, base, base_len, deltas, delta_lens, n, ...)` applies the
++checkpoints in order and refuses a missing, reordered or foreign one. A runtime restored this way
++continues the chain: its next `JS_SNAPSHOT_CHAIN` checkpoint applies on top of the last one it
++read. `JS_GetSnapshotBaseId()` returns the id the next checkpoint will apply to, for the host to
++store with it.
++
+ Bases are reproducible. Runtimes of the same engine build that are set up the same way (same host
+ natives, same code run) write byte-identical bases, in any process. So a host doesn't have to
+ store the base: it can rebuild it and keep only the deltas. `qjs --drepl` works this way. The
+diff --git a/quickjs-snapshot.c b/quickjs-snapshot.c
+index 434cf3a..e862723 100644
+--- a/quickjs-snapshot.c
++++ b/quickjs-snapshot.c
+@@ -62,6 +62,7 @@ static const uint8_t snap_magic[8] = { 'Q', 'J', 'S', 'S', 'N', 'A', 'P', '\n' }
+ typedef enum {
+     SNAP_KIND_FULL,
+     SNAP_KIND_DELTA,
++    SNAP_KIND_CHAIN, /* delta after which the written state is the new base */
+ } SnapKind;
+ 
+ typedef enum {
+@@ -606,6 +607,11 @@ void JS_DropSnapshotBase(JSRuntime *rt)
+     js_free_rt(rt, base);
+ }
+ 
++uint64_t JS_GetSnapshotBaseId(JSRuntime *rt)
++{
++    return rt->snapshot_base ? rt->snapshot_base->id : 0;
++}
++
+ /*******************************************************************/
+ /* writer */
+ 
+@@ -621,6 +627,8 @@ struct SnapWriter {
+     const JSSnapshotHost *host;
+     SnapNatives natives;
+     int flags; /* JS_SNAPSHOT_x */
++    BOOL chain; /* JS_SNAPSHOT_CHAIN: a delta, then the written state becomes the base */
++    int collected; /* bodies kept for the new base so far (in cell order) */
+     /* JS_SNAPSHOT_DELTA: the entities of the base keep their indexes,
+        the new ones are numbered after them */
+     JSSnapshotBase *base;
+@@ -1354,6 +1362,26 @@ static void snap_put_changed_body(SnapWriter *w, int idx, const DynBuf *body,
+     w->body_count++;
+ }
+ 
++/* JS_SNAPSHOT_BASE and JS_SNAPSHOT_CHAIN: keep the body of the cell 'idx'
++   for the new base. The queue is in cell order (base cells first, then
++   the new cells in numbering order), so the bodies arrive in order. */
++static int snap_collect_body(SnapWriter *w, int idx, const DynBuf *body)
++{
++    if (idx != w->collected) {
++        JS_ThrowInternalError(w->ctx, "snapshot: body #%d out of order (expected #%d)",
++                              idx, w->collected);
++        return -1;
++    }
++    if (snap_resize(w->rt, (void **)&w->base_offsets, sizeof(w->base_offsets[0]),
++                    &w->base_offsets_size, idx + 2))
++        return snap_writer_oom(w);
++    w->base_offsets[idx] = w->base_bodies.size;
++    dbuf_put(&w->base_bodies, body->buf, body->size);
++    w->base_offsets[idx + 1] = w->base_bodies.size;
++    w->collected++;
++    return 0;
++}
++
+ /* Write the body of the cell 'idx' in the bodies section, unless it is a
+    base cell whose body is the same as in the base. */
+ static int snap_write_body(SnapWriter *w, int idx)
+@@ -1380,13 +1408,19 @@ static int snap_write_body(SnapWriter *w, int idx)
+         uint32_t off = base->body_offsets[idx];
+         uint32_t base_len = base->body_offsets[idx + 1] - off;
+         if (body->size == base_len &&
+-            !memcmp(body->buf, base->bodies + off, body->size))
+-            return 0; /* unchanged */
++            !memcmp(body->buf, base->bodies + off, body->size)) {
++            /* unchanged */
++            if (w->chain)
++                return snap_collect_body(w, idx, body);
++            return 0;
++        }
+         if (snap_resize(w->rt, (void **)&w->changed, sizeof(w->changed[0]),
+                         &w->changed_size, w->changed_count + 1))
+             return snap_writer_oom(w);
+         w->changed[w->changed_count++] = idx;
+         snap_put_changed_body(w, idx, body, base->bodies + off, base_len);
++        if (w->chain)
++            return snap_collect_body(w, idx, body);
+         return 0;
+     }
+     if (w->flags & JS_SNAPSHOT_DELTA) {
+@@ -1397,15 +1431,8 @@ static int snap_write_body(SnapWriter *w, int idx)
+     }
+     dbuf_put(&w->bodies, body->buf, body->size);
+     w->body_count++;
+-    if (w->flags & JS_SNAPSHOT_BASE) {
+-        /* full snapshot: the bodies are written in cell order */
+-        if (snap_resize(w->rt, (void **)&w->base_offsets, sizeof(w->base_offsets[0]),
+-                        &w->base_offsets_size, idx + 2))
+-            return snap_writer_oom(w);
+-        w->base_offsets[idx] = w->base_bodies.size;
+-        dbuf_put(&w->base_bodies, body->buf, body->size);
+-        w->base_offsets[idx + 1] = w->base_bodies.size;
+-    }
++    if ((w->flags & JS_SNAPSHOT_BASE) || w->chain)
++        return snap_collect_body(w, idx, body);
+     return 0;
+ }
+ 
+@@ -1499,7 +1526,7 @@ static int snap_write_output(SnapWriter *w, DynBuf *roots, uint64_t *pid)
+     js_dbuf_init(w->ctx, &s->dbuf);
+     dbuf_put(&s->dbuf, snap_magic, sizeof(snap_magic));
+     bc_put_leb128(s, SNAP_FORMAT_VERSION);
+-    bc_put_u8(s, w->base ? SNAP_KIND_DELTA : SNAP_KIND_FULL);
++    bc_put_u8(s, w->chain ? SNAP_KIND_CHAIN : w->base ? SNAP_KIND_DELTA : SNAP_KIND_FULL);
+     id_pos = s->dbuf.size;
+     bc_put_u64(s, w->base ? w->base->id : 0);
+     bc_put_u32(s, w->natives.signature);
+@@ -1553,6 +1580,11 @@ static int snap_write_output(SnapWriter *w, DynBuf *roots, uint64_t *pid)
+             id = bswap64(id);
+         memcpy(s->dbuf.buf + id_pos, &id, sizeof(id));
+     }
++    if (w->chain) {
++        /* the id of the new base: the header holds the previous id, so
++           the ids form a chain */
++        *pid = snap_hash64(s->dbuf.buf, s->dbuf.size) | 1;
++    }
+     return 0;
+ }
+ 
+@@ -1606,6 +1638,70 @@ static int snap_attach_written_base(SnapWriter *w, uint64_t id)
+     return 0;
+ }
+ 
++/* JS_SNAPSHOT_CHAIN: the state that was written becomes the new base.
++   The cells, atoms and strings of the old base keep their indexes, the
++   new ones follow them, and the bodies are the ones just collected. The
++   references of the old base and of the writer are transferred. */
++static int snap_promote_written_base(SnapWriter *w, uint64_t id)
++{
++    JSRuntime *rt = w->rt;
++    JSSnapshotBase *old = w->base, *base;
++    int i, n = old->cell_count + w->cell_count;
++    int n_str = old->str_count + w->str_count;
++
++    base = js_mallocz_rt(rt, sizeof(*base));
++    if (!base)
++        return snap_writer_oom(w);
++    base->id = id;
++    base->cells = js_malloc_rt(rt, sizeof(base->cells[0]) * max_int(n, 1));
++    base->atoms = js_malloc_rt(rt, sizeof(base->atoms[0]) * max_int(w->bc.idx_to_atom_count, 1));
++    base->strs = js_malloc_rt(rt, sizeof(base->strs[0]) * max_int(n_str, 1));
++    if (!base->cells || !base->atoms || !base->strs)
++        goto oom;
++    for(i = 0; i < old->cell_count; i++)
++        base->cells[i] = old->cells[i];
++    for(i = 0; i < w->cell_count; i++)
++        base->cells[old->cell_count + i] = w->cells[i];
++    for(i = 0; i < n; i++) {
++        if (snap_map_add(rt, &base->cell_map, base->cells[i].ptr, i))
++            goto oom;
++    }
++    for(i = 0; i < old->str_count; i++)
++        base->strs[i] = old->strs[i];
++    for(i = 0; i < w->str_count; i++)
++        base->strs[old->str_count + i] = w->strs[i].key;
++    for(i = 0; i < n_str; i++) {
++        if (snap_map_add(rt, &base->str_map, JS_VALUE_GET_PTR(base->strs[i]), i))
++            goto oom;
++    }
++    /* nothing can fail from here: take the references */
++    base->cell_count = n;
++    base->str_count = n_str;
++    for(i = 0; i < w->bc.idx_to_atom_count; i++)
++        base->atoms[i] = JS_DupAtom(w->ctx, w->bc.idx_to_atom[i]);
++    base->atom_count = w->bc.idx_to_atom_count;
++    for(i = 0; i < w->str_count; i++)
++        w->strs[i].key = JS_UNDEFINED;
++    w->cell_count = 0;
++    old->cell_count = 0;
++    old->str_count = 0;
++    base->bodies = w->base_bodies.buf;
++    base->body_offsets = w->base_offsets;
++    w->base_bodies.buf = NULL;
++    w->base_offsets = NULL;
++    JS_DropSnapshotBase(rt); /* the old base: its atoms, arrays and maps */
++    rt->snapshot_base = base;
++    return 0;
++ oom:
++    js_free_rt(rt, base->cells);
++    js_free_rt(rt, base->atoms);
++    js_free_rt(rt, base->strs);
++    snap_map_free(rt, &base->cell_map);
++    snap_map_free(rt, &base->str_map);
++    js_free_rt(rt, base);
++    return snap_writer_oom(w);
++}
++
+ static void snap_writer_free(SnapWriter *w)
+ {
+     JSRuntime *rt = w->rt;
+@@ -1662,6 +1758,12 @@ uint8_t *JS_WriteSnapshot(JSContext *ctx, size_t *psize,
+     js_dbuf_init(ctx, &w->bodies);
+     js_dbuf_init(ctx, &w->base_bodies);
+ 
++    if (flags & JS_SNAPSHOT_CHAIN) {
++        /* a delta whose result is promoted to base */
++        w->chain = TRUE;
++        flags = (flags & ~JS_SNAPSHOT_CHAIN) | JS_SNAPSHOT_DELTA;
++        w->flags = flags;
++    }
+     if ((flags & ~(JS_SNAPSHOT_BASE | JS_SNAPSHOT_DELTA)) ||
+         (flags & JS_SNAPSHOT_BASE && flags & JS_SNAPSHOT_DELTA)) {
+         JS_ThrowTypeError(ctx, "snapshot: invalid flags");
+@@ -1778,6 +1880,8 @@ uint8_t *JS_WriteSnapshot(JSContext *ctx, size_t *psize,
+     dbuf_free(&roots_buf);
+     if ((flags & JS_SNAPSHOT_BASE) && snap_attach_written_base(w, id))
+         goto fail;
++    if (w->chain && snap_promote_written_base(w, id))
++        goto fail;
+     *psize = w->bc.dbuf.size;
+     snap_writer_free(w);
+     return w->bc.dbuf.buf;
+@@ -1795,6 +1899,8 @@ typedef struct {
+     SnapCellType type;
+     uint8_t done; /* body read */
+     uint8_t changed; /* base cell whose body is in the delta */
++    uint32_t changed_in; /* 1 + index of the last delta listing it as changed */
++    uint32_t body_in; /* 1 + index of the last delta giving it a body */
+     union {
+         JSClassID class_id; /* SNAP_CELL_OBJECT */
+         struct { /* SNAP_CELL_FRAME */
+@@ -1858,10 +1964,17 @@ struct SnapReader {
+     int base_str_count;
+     uint64_t base_id; /* id of the full snapshot, 0 if it is not a base */
+     BOOL roots_seeded; /* the roots hold the Math.random() states */
+-    SnapInput base_roots, delta_roots, base_bodies, delta_bodies;
++    SnapInput base_roots, delta_roots;
+     /* base body of each base cell (to attach the base to the runtime) */
+     const uint8_t **base_body_ptrs;
+     uint32_t *base_body_lens;
++    /* current body of every cell once the deltas read so far are applied */
++    const uint8_t **cur_ptrs;
++    uint32_t *cur_lens;
++    uint8_t *cur_owned; /* body rebuilt from a patch: to free */
++    int cur_size;
++    uint64_t chain_id; /* id of the state after the last chained checkpoint */
++    BOOL attach_chain; /* attach the restored state (not the base) as the base */
+     SnapOpaque *opaques; /* host-class data, loaded at the end */
+     int opaque_count;
+     int opaque_size;
+@@ -3016,7 +3129,7 @@ static int snap_new_cell(SnapReader *r, SnapRCell *c)
+ }
+ 
+ /* magic, version, kind, base id, signature and class table */
+-static int snap_read_header(SnapReader *r, SnapKind kind, uint64_t *pid)
++static int snap_read_header(SnapReader *r, SnapKind kind, uint64_t *pid, SnapKind *pkind)
+ {
+     JSRuntime *rt = r->rt;
+     uint32_t version, signature, class_count, i, len;
+@@ -3033,8 +3146,11 @@ static int snap_read_header(SnapReader *r, SnapKind kind, uint64_t *pid)
+         return snap_error(r, "unsupported snapshot version %u", version);
+     if (snap_hdr_u8(r, &kind1))
+         return -1;
+-    if (kind1 != kind)
++    if (kind == SNAP_KIND_FULL ? kind1 != SNAP_KIND_FULL :
++        (kind1 != SNAP_KIND_DELTA && kind1 != SNAP_KIND_CHAIN))
+         return snap_error(r, kind == SNAP_KIND_FULL ? "not a full snapshot" : "not a delta snapshot");
++    if (pkind)
++        *pkind = kind1;
+     if (r->bc.buf_end - r->bc.ptr < 8 + 4)
+         return snap_error(r, "truncated snapshot");
+     id = get_u64(r->bc.ptr);
+@@ -3391,12 +3507,39 @@ static int snap_read_body(SnapReader *r, int idx, uint32_t len)
+     return 0;
+ }
+ 
+-/* bodies of the base cells, except the ones replaced by the delta */
+-static int snap_read_base_bodies(SnapReader *r)
++/* current bodies: one slot per cell */
++static int snap_grow_cur(SnapReader *r)
++{
++    int n = r->cell_count, old = r->cur_size;
++    if (n <= old)
++        return 0;
++    r->cur_ptrs = js_realloc_rt(r->rt, r->cur_ptrs, sizeof(r->cur_ptrs[0]) * n);
++    r->cur_lens = js_realloc_rt(r->rt, r->cur_lens, sizeof(r->cur_lens[0]) * n);
++    r->cur_owned = js_realloc_rt(r->rt, r->cur_owned, n);
++    if (!r->cur_ptrs || !r->cur_lens || !r->cur_owned)
++        return snap_error(r, "out of memory");
++    memset(r->cur_ptrs + old, 0, sizeof(r->cur_ptrs[0]) * (n - old));
++    memset(r->cur_lens + old, 0, sizeof(r->cur_lens[0]) * (n - old));
++    memset(r->cur_owned + old, 0, n - old);
++    r->cur_size = n;
++    return 0;
++}
++
++static void snap_set_cur(SnapReader *r, int idx, const uint8_t *ptr, uint32_t len, BOOL owned)
++{
++    if (r->cur_owned[idx])
++        js_free_rt(r->rt, (void *)r->cur_ptrs[idx]);
++    r->cur_ptrs[idx] = ptr;
++    r->cur_lens[idx] = len;
++    r->cur_owned[idx] = owned;
++}
++
++/* bodies of the base cells: recorded, read once the deltas are applied */
++static int snap_scan_base_bodies(SnapReader *r, const SnapInput *in)
+ {
+     uint32_t i, n, len;
+ 
+-    snap_set_input(r, &r->base_bodies);
++    snap_set_input(r, in);
+     if (snap_get_leb(r, &n))
+         return -1;
+     if (n != r->base_cell_count)
+@@ -3408,28 +3551,21 @@ static int snap_read_base_bodies(SnapReader *r)
+             return snap_error(r, "truncated snapshot");
+         r->base_body_ptrs[i] = r->bc.ptr;
+         r->base_body_lens[i] = len;
+-        if (r->cells[i].changed) {
+-            r->bc.ptr += len;
+-        } else {
+-            if (snap_read_body(r, i, len))
+-                return -1;
+-        }
++        snap_set_cur(r, i, r->bc.ptr, len, FALSE);
++        r->bc.ptr += len;
+     }
+     if (r->bc.ptr != r->bc.buf_end)
+         return snap_error(r, "trailing data");
+     return 0;
+ }
+ 
+-/* Read the body of the changed base cell 'idx' from its patch, the next
+-   'len' bytes (see snap_put_changed_body()): the body is rebuilt from its
+-   base body, then read. */
+-static int snap_read_patched_body(SnapReader *r, int idx, uint32_t len)
++/* Rebuild the body of the cell 'idx' from its patch, the next 'len'
++   bytes (see snap_put_changed_body()), applied to its current body. */
++static int snap_apply_patch(SnapReader *r, int idx, uint32_t len)
+ {
+-    const uint8_t *base_body = r->base_body_ptrs[idx];
+-    const uint8_t *start = r->bc.buf_start, *end = r->bc.buf_end, *patch_end;
+-    uint32_t base_len = r->base_body_lens[idx], prefix, suffix, mid, size;
++    const uint8_t *cur = r->cur_ptrs[idx], *end = r->bc.buf_end, *patch_end;
++    uint32_t cur_len = r->cur_lens[idx], prefix, suffix, mid, size;
+     uint8_t *body;
+-    int ret;
+ 
+     if (len > end - r->bc.ptr)
+         return snap_error(r, "truncated snapshot");
+@@ -3437,72 +3573,105 @@ static int snap_read_patched_body(SnapReader *r, int idx, uint32_t len)
+     r->bc.buf_end = patch_end;
+     if (snap_get_leb(r, &prefix) || snap_get_leb(r, &suffix))
+         return -1;
+-    if (prefix > base_len || suffix > base_len - prefix)
++    if (prefix > cur_len || suffix > cur_len - prefix)
+         return snap_error(r, "invalid delta body");
+     mid = patch_end - r->bc.ptr;
+     size = prefix + mid + suffix;
+     body = js_malloc_rt(r->rt, max_int(size, 1));
+     if (!body)
+         return snap_error(r, "out of memory");
+-    memcpy(body, base_body, prefix);
++    memcpy(body, cur, prefix);
+     memcpy(body + prefix, r->bc.ptr, mid);
+-    memcpy(body + prefix + mid, base_body + base_len - suffix, suffix);
+-    r->bc.buf_start = r->bc.ptr = body;
+-    r->bc.buf_end = body + size;
+-    ret = snap_read_body(r, idx, size);
+-    js_free_rt(r->rt, body);
+-    r->bc.buf_start = start;
++    memcpy(body + prefix + mid, cur + cur_len - suffix, suffix);
++    snap_set_cur(r, idx, body, size, TRUE);
+     r->bc.ptr = patch_end;
+     r->bc.buf_end = end;
+-    return ret;
++    return 0;
+ }
+ 
+-/* bodies of the changed base cells and of the new cells */
+-static int snap_read_delta_bodies(SnapReader *r)
++/* bodies of delta 'd' (cells numbered from 'start' are its new cells):
++   they replace the current bodies, nothing is read yet */
++static int snap_apply_delta_bodies(SnapReader *r, const SnapInput *in, int start,
++                                   int d, uint32_t changed_count)
+ {
+-    uint32_t i, n, idx, len;
++    uint32_t i, n, idx, len, applied = 0;
+ 
+-    snap_set_input(r, &r->delta_bodies);
++    snap_set_input(r, in);
+     if (snap_get_leb(r, &n))
+         return -1;
+     for(i = 0; i < n; i++) {
+         if (snap_get_leb(r, &idx) || snap_get_leb(r, &len))
+             return -1;
+-        if (idx >= r->cell_count ||
+-            (idx < r->base_cell_count && !r->cells[idx].changed) ||
+-            ((len & 1) && idx >= r->base_cell_count))
++        if (idx >= r->cell_count)
+             return snap_error(r, "invalid delta body");
+-        if ((len & 1) ? snap_read_patched_body(r, idx, len >> 1) :
+-            snap_read_body(r, idx, len >> 1))
+-            return -1;
++        if (idx < start) {
++            if (r->cells[idx].changed_in != d + 1 || r->cells[idx].body_in == d + 1)
++                return snap_error(r, "invalid delta body");
++            applied++;
++        } else if ((len & 1) || r->cur_ptrs[idx]) {
++            return snap_error(r, "invalid delta body");
++        }
++        r->cells[idx].body_in = d + 1;
++        if (len & 1) {
++            if (snap_apply_patch(r, idx, len >> 1))
++                return -1;
++        } else {
++            len >>= 1;
++            if (len > r->bc.buf_end - r->bc.ptr)
++                return snap_error(r, "truncated snapshot");
++            snap_set_cur(r, idx, r->bc.ptr, len, FALSE);
++            r->bc.ptr += len;
++        }
+     }
++    if (applied != changed_count)
++        return snap_error(r, "changed cell without body");
+     if (r->bc.ptr != r->bc.buf_end)
+         return snap_error(r, "trailing data");
+     return 0;
+ }
+ 
++/* read every cell from its current body */
++static int snap_read_bodies(SnapReader *r)
++{
++    SnapInput in;
++    int i;
++
++    for(i = 0; i < r->cell_count; i++) {
++        if (!r->cur_ptrs[i])
++            return snap_error(r, "%s #%d has no body", snap_cell_type_names[r->cells[i].type], i);
++        in.start = in.ptr = r->cur_ptrs[i];
++        in.end = r->cur_ptrs[i] + r->cur_lens[i];
++        snap_set_input(r, &in);
++        if (snap_read_body(r, i, r->cur_lens[i]))
++            return -1;
++    }
++    return 0;
++}
++
+ /* the snapshot that was read is a base: attach it to the runtime with
+    the base bodies, so that the runtime can write deltas */
+-static int snap_attach_read_base(SnapReader *r)
++static int snap_attach_read_base(SnapReader *r, int n, const uint8_t **ptrs,
++                                 const uint32_t *lens, int atom_count,
++                                 int str_count, uint64_t id)
+ {
+     JSRuntime *rt = r->rt;
+     JSSnapshotBase *base;
+     uint32_t off;
+-    int i, n = r->base_cell_count;
++    int i;
+ 
+     base = js_mallocz_rt(rt, sizeof(*base));
+     if (!base)
+         return snap_error(r, "out of memory");
+     rt->snapshot_base = base; /* freed by JS_DropSnapshotBase() on error */
+-    base->id = r->base_id;
++    base->id = id;
+     off = 0;
+     for(i = 0; i < n; i++)
+-        off += r->base_body_lens[i];
++        off += lens[i];
+     base->cells = js_malloc_rt(rt, sizeof(base->cells[0]) * max_int(n, 1));
+     base->body_offsets = js_malloc_rt(rt, sizeof(base->body_offsets[0]) * (n + 1));
+     base->bodies = js_malloc_rt(rt, max_int(off, 1));
+-    base->atoms = js_malloc_rt(rt, sizeof(base->atoms[0]) * max_int(r->base_atom_count, 1));
+-    base->strs = js_malloc_rt(rt, sizeof(base->strs[0]) * max_int(r->base_str_count, 1));
++    base->atoms = js_malloc_rt(rt, sizeof(base->atoms[0]) * max_int(atom_count, 1));
++    base->strs = js_malloc_rt(rt, sizeof(base->strs[0]) * max_int(str_count, 1));
+     if (!base->cells || !base->body_offsets || !base->bodies || !base->atoms || !base->strs)
+         goto fail;
+     off = 0;
+@@ -3515,13 +3684,13 @@ static int snap_attach_read_base(SnapReader *r)
+         if (snap_map_add(rt, &base->cell_map, c->ptr, i))
+             goto fail;
+         base->body_offsets[i] = off;
+-        memcpy(base->bodies + off, r->base_body_ptrs[i], r->base_body_lens[i]);
+-        off += r->base_body_lens[i];
++        memcpy(base->bodies + off, ptrs[i], lens[i]);
++        off += lens[i];
+     }
+     base->body_offsets[n] = off;
+-    for(i = 0; i < r->base_atom_count; i++)
++    for(i = 0; i < atom_count; i++)
+         base->atoms[base->atom_count++] = JS_DupAtom(r->ctx, r->bc.idx_to_atom[i]);
+-    for(i = 0; i < r->base_str_count; i++) {
++    for(i = 0; i < str_count; i++) {
+         base->strs[base->str_count++] = JS_DupValue(r->ctx, JS_MKPTR(JS_TAG_STRING, r->strs[i]));
+         if (snap_map_add(rt, &base->str_map, r->strs[i], i))
+             goto fail;
+@@ -3553,6 +3722,13 @@ static void snap_reader_free(SnapReader *r)
+     js_free_rt(rt, r->obj_flags);
+     js_free_rt(rt, r->base_body_ptrs);
+     js_free_rt(rt, r->base_body_lens);
++    for(i = 0; i < r->cur_size; i++) {
++        if (r->cur_owned[i])
++            js_free_rt(rt, (void *)r->cur_ptrs[i]);
++    }
++    js_free_rt(rt, r->cur_ptrs);
++    js_free_rt(rt, r->cur_lens);
++    js_free_rt(rt, r->cur_owned);
+     for(i = 0; i < r->str_count; i++)
+         JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_STRING, r->strs[i]));
+     js_free_rt(rt, r->strs);
+@@ -3573,11 +3749,21 @@ int JS_ReadSnapshot(JSRuntime *rt, const uint8_t *buf, size_t buf_len,
+                     const uint8_t *delta, size_t delta_len,
+                     const JSSnapshotHost *host, JSSnapshotResult *res,
+                     char *errbuf, size_t errbuf_size)
++{
++    return JS_ReadSnapshotChain(rt, buf, buf_len, delta ? &delta : NULL,
++                                delta ? &delta_len : NULL, delta ? 1 : 0,
++                                host, res, errbuf, errbuf_size);
++}
++
++int JS_ReadSnapshotChain(JSRuntime *rt, const uint8_t *buf, size_t buf_len,
++                         const uint8_t * const *deltas, const size_t *delta_lens,
++                         int delta_count, const JSSnapshotHost *host,
++                         JSSnapshotResult *res, char *errbuf, size_t errbuf_size)
+ {
+     SnapReader rr, *r = &rr;
+-    SnapInput in;
++    SnapInput in, base_bodies;
+     size_t gc_threshold;
+-    int i, ret = -1;
++    int i, d, ret = -1;
+ 
+     memset(r, 0, sizeof(*r));
+     memset(res, 0, sizeof(*res));
+@@ -3608,7 +3794,7 @@ int JS_ReadSnapshot(JSRuntime *rt, const uint8_t *buf, size_t buf_len,
+     in.start = in.ptr = buf;
+     in.end = buf + buf_len;
+     snap_set_input(r, &in);
+-    if (snap_read_header(r, SNAP_KIND_FULL, &r->base_id) ||
++    if (snap_read_header(r, SNAP_KIND_FULL, &r->base_id, NULL) ||
+         snap_read_cell_headers(r))
+         goto fail;
+     r->base_cell_count = r->cell_count;
+@@ -3623,43 +3809,65 @@ int JS_ReadSnapshot(JSRuntime *rt, const uint8_t *buf, size_t buf_len,
+         goto fail;
+     r->base_atom_count = r->bc.idx_to_atom_count;
+     r->base_str_count = r->str_count;
+-    r->base_bodies.start = buf;
+-    r->base_bodies.ptr = r->bc.ptr;
+-    r->base_bodies.end = buf + buf_len;
++    base_bodies.start = buf;
++    base_bodies.ptr = r->bc.ptr;
++    base_bodies.end = buf + buf_len;
++    if (snap_grow_cur(r) || snap_scan_base_bodies(r, &base_bodies))
++        goto fail;
+ 
+-    if (delta) {
++    r->chain_id = r->base_id;
++    for(d = 0; d < delta_count; d++) {
+         uint64_t id;
+         uint32_t n, idx;
+         int start = r->cell_count;
++        SnapKind kind;
++        SnapInput bodies;
+ 
+-        in.start = in.ptr = delta;
+-        in.end = delta + delta_len;
++        in.start = in.ptr = deltas[d];
++        in.end = deltas[d] + delta_lens[d];
+         snap_set_input(r, &in);
+-        if (snap_read_header(r, SNAP_KIND_DELTA, &id))
++        if (snap_read_header(r, SNAP_KIND_DELTA, &id, &kind))
++            goto fail;
++        if (!r->chain_id || id != r->chain_id) {
++            if (d == 0)
++                snap_error(r, "the delta was not written from this base");
++            else
++                snap_error(r, "checkpoint #%d does not continue checkpoint #%d", d, d - 1);
+             goto fail;
+-        if (!r->base_id || id != r->base_id) {
+-            snap_error(r, "the delta was not written from this base");
++        }
++        if (kind != SNAP_KIND_CHAIN && d != delta_count - 1) {
++            snap_error(r, "checkpoint #%d is a plain delta: only the last one may be", d);
+             goto fail;
+         }
+-        if (snap_read_cell_headers(r) || snap_new_cells(r, start))
++        if (snap_read_cell_headers(r) || snap_new_cells(r, start) || snap_grow_cur(r))
+             goto fail;
+         if (snap_hdr_leb(r, &n))
+             goto fail;
+         for(i = 0; i < n; i++) {
+             if (snap_hdr_leb(r, &idx))
+                 goto fail;
+-            if (idx >= r->base_cell_count || r->cells[idx].changed) {
++            if (idx >= start || r->cells[idx].changed_in == d + 1) {
+                 snap_error(r, "invalid changed cell");
+                 goto fail;
+             }
++            r->cells[idx].changed_in = d + 1;
+             r->cells[idx].changed = TRUE;
+         }
+         if (snap_read_atoms(r) || snap_read_strings(r) ||
+             snap_hdr_section(r, &r->delta_roots))
+             goto fail;
+-        r->delta_bodies.start = delta;
+-        r->delta_bodies.ptr = r->bc.ptr;
+-        r->delta_bodies.end = delta + delta_len;
++        bodies.start = deltas[d];
++        bodies.ptr = r->bc.ptr;
++        bodies.end = deltas[d] + delta_lens[d];
++        if (snap_apply_delta_bodies(r, &bodies, start, d, n))
++            goto fail;
++        if (kind == SNAP_KIND_CHAIN) {
++            r->chain_id = snap_hash64(deltas[d], delta_lens[d]) | 1;
++            r->attach_chain = TRUE;
++        } else {
++            r->chain_id = 0;
++            r->attach_chain = FALSE;
++        }
+     }
+ 
+     r->obj_flags = js_mallocz_rt(rt, max_int(r->cell_count, 1));
+@@ -3667,15 +3875,15 @@ int JS_ReadSnapshot(JSRuntime *rt, const uint8_t *buf, size_t buf_len,
+         snap_error(r, "out of memory");
+         goto fail;
+     }
+-    snap_set_input(r, delta ? &r->delta_roots : &r->base_roots);
+-    r->roots_seeded = delta || !r->base_id;
++    snap_set_input(r, delta_count ? &r->delta_roots : &r->base_roots);
++    r->roots_seeded = delta_count > 0 || !r->base_id;
+     if (snap_read_roots(r, res))
+         goto fail;
+     if (r->bc.ptr != r->bc.buf_end) {
+         snap_error(r, "corrupted roots");
+         goto fail;
+     }
+-    if (snap_read_base_bodies(r) || (delta && snap_read_delta_bodies(r)))
++    if (snap_read_bodies(r))
+         goto fail;
+     for(i = 0; i < r->cell_count; i++) {
+         if (!r->cells[i].done) {
+@@ -3710,8 +3918,17 @@ int JS_ReadSnapshot(JSRuntime *rt, const uint8_t *buf, size_t buf_len,
+                               host->opaque) < 0)
+             goto fail;
+     }
+-    if (r->base_id && snap_attach_read_base(r))
++    if (r->attach_chain) {
++        /* the restored state is the base of the next checkpoint */
++        if (snap_attach_read_base(r, r->cell_count, r->cur_ptrs, r->cur_lens,
++                                  r->bc.idx_to_atom_count, r->str_count, r->chain_id))
++            goto fail;
++    } else if (r->base_id &&
++               snap_attach_read_base(r, r->base_cell_count, r->base_body_ptrs,
++                                     r->base_body_lens, r->base_atom_count,
++                                     r->base_str_count, r->base_id)) {
+         goto fail;
++    }
+     ret = 0;
+     goto done;
+  fail:
+diff --git a/quickjs.h b/quickjs.h
+index 56e326b..167ea38 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1443,7 +1443,9 @@ int JS_ResolveModule(JSContext *ctx, JSValueConst obj);
+    applies a delta on top of its base. A runtime restored from a base
+    (with or without a delta) has that base attached, so its next deltas
+    are relative to the same base. Deltas are not chained: each one only
+-   needs the base.
++   needs the base. Chained checkpoints (JS_SNAPSHOT_CHAIN) are: each one
++   holds what changed since the previous checkpoint and
++   JS_ReadSnapshotChain() applies a sequence of them.
+ 
+    A base is reproducible: runtimes of the same engine build set up the
+    same way (same host natives, same code run) write the same base bytes,
+@@ -1501,6 +1503,11 @@ typedef struct JSSnapshotHost {
+ #define JS_SNAPSHOT_BASE  (1 << 0)
+ /* only the differences with the base of the runtime */
+ #define JS_SNAPSHOT_DELTA (1 << 1)
++/* chained checkpoint: a delta relative to the current base, after which
++   the state that was written becomes the new base of the runtime. The
++   next checkpoint then only contains what changed since this one.
++   JS_ReadSnapshotChain() applies a sequence of checkpoints. */
++#define JS_SNAPSHOT_CHAIN (1 << 2)
+ 
+ /* Serialize the runtime of 'ctx' ('flags' is 0 for a self-contained
+    snapshot, or one of JS_SNAPSHOT_x). 'roots' are values held by the host
+@@ -1528,6 +1535,19 @@ int JS_ReadSnapshot(JSRuntime *rt, const uint8_t *buf, size_t buf_len,
+                     const uint8_t *delta, size_t delta_len,
+                     const JSSnapshotHost *host, JSSnapshotResult *res,
+                     char *errbuf, size_t errbuf_size);
++/* Same as JS_ReadSnapshot() with a sequence of 'delta_count' deltas
++   applied in order on top of 'buf': every delta but the last must be a
++   chained checkpoint (JS_SNAPSHOT_CHAIN) and each one must have been
++   written from the state left by the previous one. If the last delta is
++   a chained checkpoint, the restored state becomes the base of 'rt', so
++   the next checkpoint it writes continues the chain. */
++int JS_ReadSnapshotChain(JSRuntime *rt, const uint8_t *buf, size_t buf_len,
++                         const uint8_t * const *deltas, const size_t *delta_lens,
++                         int delta_count, const JSSnapshotHost *host,
++                         JSSnapshotResult *res, char *errbuf, size_t errbuf_size);
++/* id of the base attached to 'rt' (0 if none). A delta or checkpoint
++   written now records it as the id of the state it applies to. */
++uint64_t JS_GetSnapshotBaseId(JSRuntime *rt);
+ /* Detach the base of the incremental snapshots (if any): the cells of
+    the base can be garbage collected again. */
+ void JS_DropSnapshotBase(JSRuntime *rt);
+-- 
+2.54.0 (Apple Git-157)
+
