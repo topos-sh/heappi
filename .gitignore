@@ -13,3 +13,6 @@ app/data/
 app/workspace/*
 !app/workspace/README.md
 .env
+
+bench/out/
+embed/out/

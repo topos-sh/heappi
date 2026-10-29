@@ -41,7 +41,7 @@ The field makes agents durable in three ways: a journal of steps to replay (Temp
 
 ## Benchmarks
 
-Same scenario on each system: 50 turns, each a model call, a script that fetches a 19 KB source and keeps it as working memory, a tool call, a reply. The model is scripted. Scripts in `baselines/`, raw numbers in `bench/out/`.
+Same scenario on each system: 50 turns, each a model call, a script that fetches a 19 KB source and keeps it as working memory, a tool call, a reply. The model is scripted. Scripts in `baselines/`; each writes its raw numbers to `bench/out/`.
 
 | | heappi, Pi inside the heap | Pi Durable on its own SQLite storage | LangGraph with its SQLite checkpointer |
 |---|---|---|---|
