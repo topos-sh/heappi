@@ -3,6 +3,9 @@ node_modules/
 *.sqlite-*
 cf/src/heappi.wasm
 cf/src/harness.txt
+cf/src/pi-harness.txt
+cf/src/ui.html
+cf/.dev.vars
 cf/.wrangler/
 .wrangler/
 embed/pi-bundle.js

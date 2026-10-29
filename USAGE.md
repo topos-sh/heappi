@@ -171,7 +171,24 @@ One Durable Object per agent, keyed by name. Endpoints under `/agents/:id/`:
 | `r2ping` | raw R2 latencies from the object |
 | `reset` | delete storage and R2 objects for the agent |
 
-The object's SQLite holds `head`, `checkpoints`, `blobs` (chunked under 2 MB), `journal`, `messages`. R2 holds `agents/<id>/<seq>-<kind>.bin` and `agents/<id>/head`, written by conditional put. In-object timings read zero for pure CPU because Workers freeze the clock; time from the client.
+The object's SQLite holds `head` (with the layer key), `checkpoints` and `blobs` (chunked under 2 MB; the engine layer at seq -2 and the harness layer at seq -1, the agent's fold and checkpoints from seq 1), `journal`, `messages`. R2 holds `layers/<key>-engine.bin` and `layers/<key>-harness.bin` once per harness source, `agents/<id>/<seq>-<kind>.bin` and `agents/<id>/head` (the key list, layers first), written by conditional put. In-object timings read zero for pure CPU because Workers freeze the clock; time from the client.
+
+### 3.10 The Cloudflare demo (`cf/wrangler.demo.jsonc`, `cf/src/demo.mjs`)
+
+The same cell with Pi Durable inside, a real model, MCP servers, alarms, SSE and the chat page, deployed as `heappi-demo`. Secrets: `ANTHROPIC_API_KEY` and `DEMO_TOKEN` (`wrangler secret put`); locally `cf/.dev.vars`. `MODEL` is a var (`claude-sonnet-5-5`; `scripted` runs the research scenario's model without a key). Every request needs the token: the page posts it once to `/api/login` and keeps a cookie; scripts send `Authorization: Bearer <token>` or `?token=`.
+
+| Path | Does |
+|---|---|
+| `GET /` | the chat page |
+| `GET /api/agents` | agents, model, tool catalog, MCP servers |
+| `POST /api/agents {id?}` | create an agent: layers, a `config` event with the catalog and instructions, first activation |
+| `GET /api/agents/:id/events` | SSE: `hello` with the transcript, `model_start`, `text_delta`, `model_done`, `progress` (tool starts and ends), `reply`, `activation` (tier, how, kind, bytes), `sys` (timers), `error` |
+| `POST /api/agents/:id/messages {text}` | a user turn |
+| `POST /api/agents/:id/signals {name, payload, afterMs}` | an external signal now, or at a Durable Object alarm after `afterMs` |
+| `/api/agents/:id/transcript`, `info`, `evict`, `reset` | Pi's entries from the journal; stats and sizes; drop the hot copy; delete the agent |
+| `POST /mcp/notes` | the notes MCP server (streamable HTTP) for outside clients |
+
+MCP servers are listed in `mcpFor()` in `demo.mjs`: `{ url }` for a remote streamable-HTTP server (optionally `tools: [...]` to expose a subset) or `{ handler }` for one hosted in the Worker. Tools reach the heap as `mcp__<server>__<tool>`.
 
 ## 4. How it works
 

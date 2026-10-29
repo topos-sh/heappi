@@ -62,7 +62,16 @@ button.primary{font:inherit;padding:8px 14px;border:0;border-radius:6px;backgrou
 <script>
 const $ = (id) => document.getElementById(id);
 let current = null, es = null, streaming = null, lastStreamed = "";
-const api = (path, opts) => fetch("/api/agents" + path, opts).then((r) => r.json());
+async function api(path, opts) {
+  let r = await fetch("/api/agents" + path, opts);
+  if (r.status === 401) { // the Cloudflare demo asks for its token once; the cookie keeps it
+    const token = prompt("This demo needs its access token (HEAPPI_DEMO_TOKEN):");
+    if (!token) throw new Error("no token");
+    await fetch("/api/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token }) });
+    r = await fetch("/api/agents" + path, opts);
+  }
+  return r.json();
+}
 function el(cls, text) { const d = document.createElement("div"); d.className = cls; d.textContent = text; $("log").appendChild(d); $("log").scrollTop = $("log").scrollHeight; return d; }
 function renderMessage(m) {
   if (!m) return;
@@ -72,7 +81,7 @@ function renderMessage(m) {
 }
 async function refreshAgents() {
   const r = await api("");
-  $("model").textContent = (r.demo ? "demo model" : r.model) + " · " + r.tools.length + " tools";
+  $("model").textContent = (r.demo ? "demo model" : r.model) + " · " + r.tools.length + " tools" + (r.mcp ? " · MCP: " + r.mcp.join(", ") : "");
   $("tools").textContent = r.tools.join("\n");
   $("agents").innerHTML = "";
   for (const id of r.agents) { const b = document.createElement("button"); b.textContent = id; b.setAttribute("aria-current", String(id === current)); b.onclick = () => select(id); $("agents").appendChild(b); }
@@ -95,8 +104,9 @@ function select(id) {
     else if (ev.type === "model_done" || ev.type === "model_cached") { if (streaming) { streaming.classList.remove("stream"); lastStreamed = streaming.textContent; } streaming = null; }
     else if (ev.type === "progress") { if (ev.event === "tool_start") el("tool", `→ ${ev.name}(${JSON.stringify(ev.args ?? {}).slice(0, 300)})`); else if (ev.event === "tool_end") el("tool", `← ${ev.name} ${ev.ok ? "ok" : "failed: " + ev.error}`); }
     else if (ev.type === "reply") { if (streaming) { streaming.classList.remove("stream"); streaming = null; } else if (ev.text && ev.text !== lastStreamed) el("msg assistant", ev.text); lastStreamed = ""; refreshStats(); }
-    else if (ev.type === "activation") { const a = $("acts"); a.textContent = `${ev.tier} ${ev.kind} ${(ev.checkpointBytes / 1024).toFixed(1)} KB restore ${ev.restoreMs.toFixed(1)} ms run ${ev.runMs.toFixed(1)} ms heap ${(ev.heapUsed / 1024).toFixed(0)} KB\n` + a.textContent.split("\n").slice(0, 7).join("\n"); }
+    else if (ev.type === "activation") { const a = $("acts"); a.textContent = `${ev.tier}${ev.how && ev.how !== "hot" ? "/" + ev.how : ""} ${ev.kind} ${(ev.checkpointBytes / 1024).toFixed(1)} KB restore ${ev.restoreMs.toFixed(1)} ms run ${ev.runMs.toFixed(1)} ms heap ${(ev.heapUsed / 1024).toFixed(0)} KB\n` + a.textContent.split("\n").slice(0, 7).join("\n"); }
     else if (ev.type === "error" || ev.type === "pi.report") el("error", ev.error ?? ev.text);
+    else if (ev.type === "sys") el("sys", ev.text);
   };
   refreshAgents(); refreshStats();
 }

@@ -41,7 +41,7 @@ const summary = {
   label: args.label, base, turns: TURNS, correct, rttMs: rtt, colo, replication: args.rep,
   turnObjectMs: median(turns.map((x) => x.turnMs)), turnClientMs: median(turns.map((x) => x.clientMs)),
   activationsPerTurn: acts.length / TURNS,
-  checkpointBytes: { parkMedian: median(parks.map((a) => a.checkpointBytes)), parkMax: Math.max(...parks.map((a) => a.checkpointBytes)), folds: acts.filter((a) => a.kind === "base").map((a) => a.checkpointBytes) },
+  checkpointBytes: { parkMedian: median(parks.map((a) => a.checkpointBytes)), parkMax: Math.max(...parks.map((a) => a.checkpointBytes)), folds: acts.filter((a) => a.kind === "fold").map((a) => a.checkpointBytes) },
   snapshotMs: median(acts.map((a) => a.snapshotMs)), commitMs: median(acts.map((a) => a.commitMs)), r2Ms: median(acts.map((a) => a.r2Ms)), runMs: median(acts.map((a) => a.runMs)),
   restore: {},
   final: turns.at(-1).info, linearBytes: acts.at(-1).linearBytes, heapUsed: acts.at(-1).heapUsed,
