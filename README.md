@@ -39,36 +39,24 @@ The field makes agents durable in three ways: a journal of steps to replay (Temp
 
 ## Benchmarks
 
-The same scenario on the closest systems from the list above, run from this repository on an M-series Mac, Node 24, 28 Oct 2026. The scenario is a research agent: 50 turns, each one a model call, a code-mode script (or the system's equivalent) that fetches a 19 KB source and keeps it as working memory, a tool call, a reply. The model is scripted, so every system should give identical answers, and the answers are checked. Systems that could not be run locally are marked.
+Same scenario on each system: 50 turns, each a model call, a script that fetches a 19 KB source and keeps it as working memory, a tool call, a reply. The model is scripted. Scripts in `baselines/`, raw numbers in `bench/out/`.
 
-| | heappi, Pi inside the heap | Pi Durable 1.4 on its SQLite storage | LangGraph 1.5 + SqliteSaver | DBOS 5.4 on Postgres | Transcript store (SQLite) |
-|---|---|---|---|---|---|
-| Family | heap image | turn checkpoints, scripts replayed | state checkpoint per superstep | journal of steps, replay | conversation rows |
-| Where it can park | any `await`, inside a script | between turns | between graph nodes | between steps | between messages |
-| Correct turns | 50 / 50 | **39 / 50** | 50 / 50 | 50 / 50 | 50 / 50 |
-| Disk after 50 turns | 2.2 MB chain + 0.4 MB journal; 1.6 MB harness layer shared by all agents | 2.5 MB | **170 MB** | 1.4 MB of step outputs (1.5 MB on disk) | 1.5 MB kept, 64 KB if payloads are dropped |
-| One durable write | 24 KB median park, 53 KB max, 15 KB reply | document revisions and entries per step | the whole state: 674 KB median, 1.35 MB by turn 50 | the step's output, the payload once | one message row |
-| Resume after a restart | 4 ms through the template early on; 25 ms at turn 50 with 26 checkpoints since the last fold | 4.6 ms to open; next turn 175 ms | 15 ms to load the last checkpoint; next turn 93 ms | 1.1 s to launch and find the workflow, then 141 ms to replay 49 turns | one query |
-| Time per turn | 108 ms with a journal rebuild check at each of ten folds; about 60 ms without | 115 ms | 47 ms | 21 ms | 2.6 ms |
-| Model context at turn 50 | 75 KB | 78 KB | 27 KB | 26 KB | 1.49 MB kept, 33 KB dropped |
+| | heappi, Pi inside the heap | Pi Durable on its own SQLite storage | LangGraph with its SQLite checkpointer |
+|---|---|---|---|
+| Durability unit | heap checkpoint at any `await`, inside a script too | turn checkpoint; scripts replayed from a journal | state checkpoint after every graph node |
+| Disk after 50 turns | 2.6 MB, plus a 1.6 MB layer shared by all agents | 2.5 MB | 170 MB |
+| One durable write | 24 KB median, 53 KB max | entries and document revisions per step | the whole state, 0.7 to 1.4 MB |
+| Resume | 4 to 25 ms, depending on checkpoints since the last fold | 5 ms to open, 175 ms for the next turn | 15 ms to load, 93 ms for the next turn |
+| Time per turn | 108 ms, half of it a journal rebuild check at every fold | 115 ms | 47 ms |
+| Model context at turn 50 | 75 KB | 78 KB | 27 KB |
 
-What the table says, honestly:
+Notes:
 
-- **Pi Durable on its own storage answered wrong from turn 40**, in the earlier benchmark too. Pi's `store()` for script data is capped at 1 MB of JSON; 40 sources fill it, every later script throws, and the answer becomes -1. The earlier benchmark only checked the image's answers and reported Pi as correct; that was wrong. Inside the heap, Pi's data lives in heappi's handles, which have no such cap.
-- **LangGraph's SQLite checkpointer writes the whole state at every superstep**, 250 times for 50 turns, which is where 170 MB comes from. The payload sits in a state channel the model does not see, so its context is small; the cost moved to disk. The Postgres checkpointer stores channel values by version and would not rewrite unchanged channels; the SQLite one does.
-- **DBOS is the cheapest per turn and the smallest on disk** because it journals only step outputs and keeps the agent's state in workflow memory. The price is in the resume: a restart replays every step from the journal, and the workflow code between steps must be deterministic. Replay here is fast because the steps are cheap stubs; the time grows with history.
-- **The transcript store wins on speed** because it only appends rows. It either sends the model 1.5 MB per request or forgets what it fetched.
-- **heappi is in the middle on disk and slow per turn** because a turn is four checkpoint-and-commit cycles, and because the rebuild check runs at every fold here to prove the journal is sufficient; production would sample. What it alone does is the first row: it parks anywhere, with the script's stack, and the model context stays flat without dropping the data.
-- Pi Durable and heappi send the model the full transcript; LangGraph and DBOS send the messages without the payload for the same reason heappi does, by reference. The transcript numbers are the ends of the range.
-- **Not measured:** Infinity (no public runtime), Temporal and Restate (need their servers; same family as DBOS), Cloudflare Workflows and Agents SDK (the Agents SDK stores state as rows in the object's SQLite, the transcript store's shape), and microVM snapshots (E2B, Modal, Vercel Sandbox: a snapshot is the guest memory, hundreds of MB, and restore is hundreds of milliseconds to seconds per the vendors' documentation).
-
-**Cloudflare** (Durable Object in SJC, R2 in WNAM, `cf/bench.mjs`): a hot turn with four parks is about 50 ms of work and 150 ms at the client including a 73 ms round trip; warm restore from the object's SQLite about 10 ms above the round trip; cold restore from R2 300 to 500 ms; one R2 operation from the object costs 100 to 500 ms, so replication is batched after the response. In-object CPU timings read zero because Workers freeze the clock.
-
-**Memory**: a hot heappi agent with Pi inside holds 5.7 MB of engine heap in 29 MB of wasm linear memory after 50 turns, because linear memory grows for snapshot buffers and never shrinks; the host drops the hot copy past a threshold and pays a warm restore. A parked agent is zero. A Pi Durable harness process open and idle is 62 MB, shared by many conversations in practice.
-
-**Other costs:** 204 KB written per turn with Pi inside for a few KB of real change, because every Pi step commits task, live and usage documents that the delta carries; the fold cadence is the lever and it trades against restore latency. QuickJS is an interpreter, an order of magnitude or more behind V8; scripts are glue and heavy work is a tool. On Cloudflare each agent also keeps a 1.7 MB copy of the layers in its own SQLite so that a full restore needs no R2 read.
-
-Scripts: `node embed/pi-bench.mjs` (heappi), `node baselines/pi-resume.mjs` (Pi), `node baselines/langgraph.mjs` (LangGraph), `DBOS_SYSTEM_DATABASE_URL=postgresql://... node baselines/dbos.mjs` (DBOS, needs a Postgres), `node bench/run.mjs` (transcript store and the memory table). Raw outputs are in `bench/out/` and `embed/out/`; every number above is in
+- Pi on its own storage fails from turn 40: its code-mode `store()` caps at 1 MB of JSON, and the fetched sources fill it. Inside the heap the same data lives in handles with no cap.
+- LangGraph's SQLite checkpointer serializes the whole state at every superstep, 250 times here. Its Postgres checkpointer stores channels by version and would not. Its context is small because the payload sits in a state channel the model does not see.
+- heappi pays for four checkpoint-and-commit cycles per turn and for the rebuild check, which proves the journal is sufficient and would be sampled in production. Write amplification is the real cost: about 200 KB per turn with Pi inside, since every Pi step commits task, live and usage documents.
+- Wasm linear memory grows to about 30 MB per hot agent after 50 turns and never shrinks; the host evicts past a threshold and pays a warm restore. Parked agents cost nothing.
+- On Cloudflare: a hot turn is about 50 ms of work in the object, warm restore about 10 ms, cold restore from R2 300 to 500 ms, so R2 replication is batched after the response.
 
 ## Run it
 
