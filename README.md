@@ -84,6 +84,25 @@ One Durable Object per agent, R2 as the cold store, alarms for delayed signals. 
 
 `npm test` runs the checks; the benchmark scripts are in `bench/`, `baselines/` and `embed/`. Rebuilding the engine needs wasi-sdk 25 and the dquickts fork; the binary is committed.
 
+## Interfaces
+
+**The heap contract.** The host knows six globals the harness defines, strings in and out: `__deliver(eventJson)`, `__drain()` returning the outbox as JSON, `__stats()`, `__stateHash()` for the rebuild check, `__migrate()` after a harness upgrade, `__peek(handle)` for debugging. Events in: `{type:"user", text}`, `{type:"signal", name, payload}`, `{type:"config", config}`, `{type:"result", id, value | error}`. Outbox out: `{kind:"call", id, name:"model"|"tool", args}`, `{kind:"reply", turn, text}`, `progress`, `pi.entry`, `error`. A call is answered by a result event with the same id in a later activation; the heap keeps the pending promise, the host keeps nothing. Any harness that implements this runs in the cell; Pi does through `embed/pi-glue.js`, the small harness natively.
+
+**What a script sees.** Four names and nothing else: `tools.<name>(args)` for any catalog tool (`run` refused), `mem[handle]` and `remember(value, label)` for working memory, `log(...)`. Only strings cross the boundary; results come back as JSON copies.
+
+**The demo API** (the same on Node and Cloudflare; on Cloudflare behind the token):
+
+| | |
+|---|---|
+| `GET/POST /api/agents` | list agents; create one `{id?, name?}` |
+| `POST /api/agents/:id/messages {text}` | a user turn |
+| `POST /api/agents/:id/signals {name, payload, afterMs?}` | an external signal, now or after a delay |
+| `GET /api/agents/:id/events` | SSE: deltas, tool starts and ends, replies, activations |
+| `/api/agents/:id/transcript`, `info`, `evict`, `rename`, `DELETE` | read, inspect, drop the hot copy, rename, remove |
+| `POST /mcp/notes` | the notes MCP server, for outside clients |
+
+**Adding a tool:** on Node, a case in the broker in `app/server.mjs`; on Cloudflare, in `DemoCell.broker` in `cf/src/demo.mjs`, plus a catalog entry with a JSON schema. **Adding an MCP server:** a line in `app/mcp.json` (stdio or streamable HTTP) or in `mcpFor()` in `cf/src/demo.mjs` (`{url}` or `{handler}`). Tools reach the heap as `mcp__<server>__<tool>`.
+
 ## Map
 
 | Path | What |
