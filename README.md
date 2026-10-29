@@ -18,8 +18,6 @@ A prototype, not a product. Benchmarked against Pi Durable on its own storage an
 | Pi Durable (Earendil Works) | Three uses: the vocabulary and discipline of the small benchmark harness (commit before anything is shown, tools as durable units, code mode as a nested call); the baseline, run as published; and the harness itself, embedded. |
 | [Infinity](https://infinity.hydro.run/) (Hydro, UC Berkeley) | The slice discipline: an execution never blocks on anything external. One FIFO per agent, stable event ids, dedup by sender sequence. |
 | [celld](https://celld.dev/) | A lease taken by a conditional write on object storage with epoch fencing; SQLite replicated to object storage as base plus increments. Became the R2 head object with `onlyIf` on its etag. |
-| Cloudflare Durable Objects | The per-agent object with SQLite and alarms is the cell; R2 is the home. |
-| [fx](https://fx.sh/) (Vercel Labs) | Assessed as the harness to embed. Zig, not JavaScript, so it cannot live inside the heap; it would sit beside the image with its own conversation-level durability. Not used. |
 
 ## How it differs
 
