@@ -23,13 +23,13 @@ export function getGateway(env) {
   gateway = {
     modelId,
     /** request = { context: { systemPrompt, messages, tools }, options } from the heap */
-    async call(request, emit) {
+    async call(request, emit, { signal, sessionId } = {}) {
       if (scripted) {
         const message = simpleToAssistant(scriptedModel({ messages: transcriptToSimple(request.context.messages), tools: [] }));
         for (const c of message.content) if (c.type === "text") emit({ type: "text_delta", delta: c.text });
         return message;
       }
-      const stream = models.stream(model, request.context, { maxTokens: request.options?.maxTokens ?? 4096 });
+      const stream = models.stream(model, request.context, { maxTokens: request.options?.maxTokens ?? 4096, signal, sessionId });
       emit({ type: "model_start", model: modelId });
       let message;
       for await (const ev of stream) {

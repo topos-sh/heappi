@@ -17,17 +17,24 @@
 //   out as `progress` records for a UI.
 // - signals: a `signal` event is submitted to Pi as user input tagged
 //   with its name, so the agent reacts to external events between turns.
+// - crash safety: each catalog tool says whether it may run twice (`replay`);
+//   the flag rides on the host call, and the host reruns or reports a call a
+//   crash cut off. Tools that may not run twice get a round of their own.
+// - steering: `steer` and `cancel` events go to Pi's own steer and abort;
+//   `requestId` on an input is Pi's own idempotency key.
+// - large catalogs: MCP tools are deferred, found through Pi's tool_search.
 "use strict";
 (() => {
-  const HARNESS_VERSION = 101;
+  const HARNESS_VERSION = 102;
   const POOL = 2;
   const HANDLE_THRESHOLD = 1024;
-  const { BACKGROUND_CONTEXT, createModels, fauxProvider, Type, createRegistry, defineExtension, defineTool, Harness, MemoryStorage } = PI;
+  const DEFER_OVER = 8; // catalogs larger than this load their MCP tools on demand
+  const { BACKGROUND_CONTEXT, createModels, fauxProvider, Type, createRegistry, defineExtension, defineTool, Harness, MemoryStorage, createToolSearchExtension } = PI;
 
   const S = globalThis.__agent ??= {
     version: HARNESS_VERSION, pending: new Map(), outbox: [], callSeq: 0,
     memory: new Map(), handleSeq: 0, turn: 0, modelCalls: 0, toolCalls: 0, scripts: 0,
-    mirrored: 0, lastEntryId: null, poolReady: false, harness: null, root: null,
+    mirrored: 0, lastEntryId: null, poolReady: false, harness: null, root: null, active: 0, seenInputs: new Set(),
     config: { tools: [], instructions: "", model: { provider: "faux", modelId: "faux-1" } },
   };
 
@@ -96,7 +103,8 @@
     for (let i = 1; i <= POOL; i++) { __evalIn(i, PRELUDE); settlers[i] = __evalIn(i, "__settle"); }
     S.poolReady = true;
   }
-  const hostTool = (name, args) => hostCall("tool", { name, args });
+  const replayOf = (name) => S.config.tools.find((t) => t.name === name)?.replay === "safe" ? "safe" : "unsafe";
+  const hostTool = (name, args) => hostCall("tool", { name, args, replay: replayOf(name) });
   globalThis.__scriptCall = (ctx, op, json) => {
     const p = JSON.parse(json);
     switch (op) {
@@ -129,14 +137,17 @@
   }
   function buildRegistry() {
     const tools = [];
+    const defer = S.config.tools.length > DEFER_OVER;
     for (const t of S.config.tools) {
-      tools.push(defineTool({ name: t.name, description: t.description ?? t.name, parameters: Type.Unsafe(t.inputSchema ?? { type: "object", properties: {} }), replay: "safe",
+      const safe = t.replay === "safe";
+      tools.push(defineTool({ name: t.name, description: t.description ?? t.name, parameters: Type.Unsafe(t.inputSchema ?? { type: "object", properties: {} }), replay: safe ? "safe" : "unsafe", ...(safe ? {} : { executionMode: "sequential" }), ...(defer && t.server ? { deferred: true } : {}),
         execute: async (args) => { S.toolCalls++; progress("tool_start", { name: t.name, args }); try { const v = await hostTool(t.name, args); progress("tool_end", { name: t.name, ok: true }); return asResult(v, t.name); } catch (e) { progress("tool_end", { name: t.name, ok: false, error: String(e?.message ?? e) }); throw e; } } }));
     }
     tools.push(defineTool({ name: "run", description: "Run JavaScript. `tools.<name>(args)` calls any tool, `mem[handle]` reads working memory, `remember(value, label)` keeps a value and returns its handle, `log(...)` prints. Return a small value; keep large data with remember.", parameters: Type.Object({ code: Type.String() }), replay: "safe",
       execute: async (args) => { progress("tool_start", { name: "run", args: { code: args.code.slice(0, 200) } }); try { const v = await runScript(args.code); progress("tool_end", { name: "run", ok: true }); return asResult(v, "run"); } catch (e) { progress("tool_end", { name: "run", ok: false, error: String(e?.message ?? e) }); throw e; } } }));
     const registry = createRegistry();
     registry.install(defineExtension({ name: "heappi", tools }));
+    if (defer) registry.install(createToolSearchExtension());
     return registry;
   }
 
@@ -156,17 +167,40 @@
       S.lastEntryId = e.id; S.mirrored++;
     }
   }
-  async function submit(text) {
-    S.turn++;
-    const root = await open();
-    const sub = await root.submit({ type: "input", content: text, whenBusy: "followUp" }, BACKGROUND_CONTEXT);
-    const settled = await sub.wait(BACKGROUND_CONTEXT);
-    await mirror(root);
-    const page = await root.entries({ order: "descending" }, 2, undefined, BACKGROUND_CONTEXT);
-    const a = page.items.find((x) => x.kind === "pi.assistant");
-    const reply = a?.model?.[0]?.content?.filter((c) => c.type === "text").map((c) => c.text).join("") ?? "";
-    S.outbox.push({ kind: "reply", turn: S.turn, text: settled.status === "done" ? reply : `unanswered: ${JSON.stringify(settled).slice(0, 300)}` });
+  const setActive = (n) => { const was = S.active > 0; S.active += n; if (was !== S.active > 0) progress("busy", { busy: S.active > 0 }); };
+  async function submit(text, requestId) {
+    setActive(1);
+    try {
+      const root = await open();
+      const sub = await root.submit({ type: "input", content: text, whenBusy: "followUp", ...(requestId ? { requestId } : {}) }, BACKGROUND_CONTEXT);
+      if (requestId) { if (S.seenInputs.has(sub.id)) return; S.seenInputs.add(sub.id); } // Pi handed back the first submission: a retry, already being answered
+      S.turn++;
+      const settled = await sub.wait(BACKGROUND_CONTEXT);
+      await mirror(root);
+      const page = await root.entries({ order: "descending" }, 2, undefined, BACKGROUND_CONTEXT);
+      const a = page.items.find((x) => x.kind === "pi.assistant");
+      const reply = a?.model?.[0]?.content?.filter((c) => c.type === "text").map((c) => c.text).join("") ?? "";
+      S.outbox.push({ kind: "reply", turn: S.turn, text: settled.status === "done" ? reply : S.cancelled ? "(stopped)" : `unanswered: ${JSON.stringify(settled).slice(0, 300)}`, ...(S.cancelled ? { cancelled: true } : {}) });
+    } finally { setActive(-1); if (!S.active) S.cancelled = false; }
   }
+  /** joins the running work at the next safe point; with nothing running it is an ordinary input */
+  async function steer(text, requestId) {
+    if (!S.active) return submit(text, requestId);
+    await (await open()).submit({ type: "input", content: text, whenBusy: "steer", ...(requestId ? { requestId } : {}) }, BACKGROUND_CONTEXT);
+    progress("steered", { text });
+  }
+  /** stops the run; a host call still out is answered here at once, and its late result is dropped */
+  async function cancel() {
+    if (!S.root || !S.active) return;
+    S.cancelled = true;
+    const stopping = S.root.abort(BACKGROUND_CONTEXT);
+    for (const [id, p] of S.pending) { S.pending.delete(id); p.reject(new Error("cancelled")); }
+    await stopping;
+    // the stopped request stays in the transcript; without this the model would answer it with the next message
+    await S.root.submit({ type: "write", entry: { kind: "heappi.stopped", data: null, model: [{ role: "user", content: "[The user stopped the request above. Do not continue or answer it unless asked again.]", timestamp: Date.now() }] } }, BACKGROUND_CONTEXT);
+    await mirror(S.root);
+  }
+  const report = (e) => S.outbox.push({ kind: "error", error: String(e && e.stack || e) });
 
   // ---- host contract ----
   globalThis.__deliver = (json) => {
@@ -174,14 +208,16 @@
     switch (ev.type) {
       case "result": { const p = S.pending.get(ev.id); if (!p) { S.outbox.push({ kind: "late_result", id: ev.id }); return; } S.pending.delete(ev.id); ev.error ? p.reject(new Error(ev.error)) : p.resolve(ev.value); return; }
       case "config": S.config = { ...S.config, ...ev.config }; if (S.root) S.outbox.push({ kind: "error", error: "config after open is not applied until the next harness upgrade" }); return;
-      case "user": submit(ev.text).catch((e) => S.outbox.push({ kind: "error", error: String(e && e.stack || e) })); return;
-      case "signal": submit(`[signal:${ev.name}] ${typeof ev.payload === "string" ? ev.payload : JSON.stringify(ev.payload ?? null)}`).catch((e) => S.outbox.push({ kind: "error", error: String(e && e.stack || e) })); return;
+      case "user": submit(ev.text, ev.requestId).catch(report); return;
+      case "steer": steer(ev.text, ev.requestId).catch(report); return;
+      case "cancel": cancel().catch(report); return;
+      case "signal": submit(`[signal:${ev.name}] ${typeof ev.payload === "string" ? ev.payload : JSON.stringify(ev.payload ?? null)}`).catch(report); return;
       default: S.outbox.push({ kind: "error", error: "unknown event " + ev.type });
     }
   };
   globalThis.__pump = () => __runTimers();
   globalThis.__drain = () => { const s = JSON.stringify(S.outbox); S.outbox.length = 0; return s; };
-  globalThis.__stats = () => JSON.stringify({ version: S.version, turn: S.turn, handles: S.memory.size, pending: S.pending.size, modelCalls: S.modelCalls, toolCalls: S.toolCalls, scripts: S.scripts, mirrored: S.mirrored, tools: S.config.tools.length, harness: "pi-durable" });
+  globalThis.__stats = () => JSON.stringify({ version: S.version, turn: S.turn, handles: S.memory.size, pending: S.pending.size, modelCalls: S.modelCalls, toolCalls: S.toolCalls, scripts: S.scripts, mirrored: S.mirrored, tools: S.config.tools.length, busy: S.active > 0, harness: "pi-durable" });
   globalThis.__peek = (handle) => JSON.stringify(S.memory.get(handle)?.value ?? null);
   function fnv(str) { let h = 0x811c9dc5; for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return h.toString(16).padStart(8, "0"); }
   globalThis.__stateHash = () => {

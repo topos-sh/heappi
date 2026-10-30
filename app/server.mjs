@@ -29,8 +29,8 @@ const store = new Store(join(dataDir, "cells.sqlite"), join(dataDir, "cold"));
 const gateway = createGateway({ demo: DEMO });
 const mcp = await connectMcp(join(here, "mcp.json"));
 const builtinTools = [
-  { name: "fetch", description: "Fetch a URL over HTTP and return its text (first 20 KB).", inputSchema: { type: "object", properties: { url: { type: "string" }, source: { type: "number", description: "demo only: a numbered sample source" } } } },
-  { name: "now", description: "Current date and time, ISO 8601.", inputSchema: { type: "object", properties: {} } },
+  { name: "fetch", description: "Fetch a URL over HTTP and return its text (first 20 KB).", inputSchema: { type: "object", properties: { url: { type: "string" }, source: { type: "number", description: "demo only: a numbered sample source" } } }, replay: "safe" },
+  { name: "now", description: "Current date and time, ISO 8601.", inputSchema: { type: "object", properties: {} }, replay: "safe" },
 ];
 const catalog = [...builtinTools, ...mcp.catalog];
 const INSTRUCTIONS = readFileSync(join(here, "instructions.md"), "utf8");
@@ -41,19 +41,19 @@ const publish = (agentId, event) => { for (const res of sse.get(agentId) ?? []) 
 
 const broker = {
   inflight: new Set(),
-  call(agentId, _id, name, args) {
+  call(agentId, _id, name, args, { key, signal } = {}) {
     const p = (async () => {
-      if (name === "model") return gateway.call(agentId, args);
+      if (name === "model") return gateway.call(agentId, args, { signal });
       if (name === "tool") {
         const { name: tool, args: a } = args;
         if (tool === "fetch") {
           if (a?.source !== undefined) return fetchSource(Number(a.source)); // the demo scenario's sources
           if (typeof a?.url !== "string") throw new Error("fetch needs { url }");
-          const r = await fetch(a.url, { signal: AbortSignal.timeout(20000) });
+          const r = await fetch(a.url, { signal: AbortSignal.any([AbortSignal.timeout(20000), ...(signal ? [signal] : [])]) });
           return { status: r.status, text: (await r.text()).slice(0, 20000) };
         }
         if (tool === "now") return new Date().toISOString();
-        if (tool.startsWith("mcp__")) return mcp.call(tool, a);
+        if (tool.startsWith("mcp__")) return mcp.call(tool, a, { key, signal });
         throw new Error("unknown tool " + tool);
       }
       throw new Error("unknown call " + name);
@@ -118,7 +118,8 @@ const server = http.createServer(async (req, res) => {
       req.on("close", () => sse.get(id)?.delete(res));
       return;
     }
-    if (op === "messages" && req.method === "POST") { const { text } = await body(req); store.enqueue(id, { type: "user", text }, { sender: "ui" }); run(id); return json(res, { ok: true }); }
+    if (op === "messages" && req.method === "POST") { const { text, requestId, mode } = await body(req); store.enqueue(id, { type: mode === "steer" ? "steer" : "user", text, requestId }, { sender: "ui" }); run(id); return json(res, { ok: true }); }
+    if (op === "cancel" && req.method === "POST") { store.enqueue(id, { type: "cancel" }, { sender: "ui" }); cell.abortCalls(id); run(id); return json(res, { ok: true }); }
     if (op === "signals" && req.method === "POST") { const { name, payload, afterMs } = await body(req); const fire = () => { store.enqueue(id, { type: "signal", name, payload }, { sender: "signals" }); run(id); }; if (afterMs) setTimeout(fire, afterMs); else fire(); return json(res, { ok: true, scheduled: !!afterMs }); }
     if (op === "transcript") return json(res, { transcript: transcript(id) });
     if (op === "evict" && req.method === "POST") { cell.evictHot(id); return json(res, { ok: true }); }
@@ -126,6 +127,8 @@ const server = http.createServer(async (req, res) => {
     return json(res, { error: "unknown op" }, 404);
   } catch (e) { return json(res, { error: String(e?.stack ?? e) }, 500); }
 });
+// calls a crash cut off: safe ones run again, the others are reported to the model
+for (const { id } of agents()) { const r = cell.recover(id); if (r.rerun.length || r.interrupted.length) console.log(`recovered ${id}: rerun ${r.rerun.length}, interrupted ${r.interrupted.length}`); run(id); }
 server.listen(PORT, () => console.log(`heappi app on http://localhost:${PORT} (${DEMO ? "demo model" : gateway.modelId}; ${catalog.length} tools: ${catalog.map((t) => t.name).join(", ")})`));
 process.on("unhandledRejection", (e) => console.error("unhandled:", e?.stack ?? e));
 process.on("SIGINT", async () => { await mcp.close(); store.close(); process.exit(0); });

@@ -35,6 +35,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS senders (agent TEXT, sender TEXT, high INTEGER, PRIMARY KEY (agent, sender));
       CREATE TABLE IF NOT EXISTS outbox (agent TEXT, call_id INTEGER, name TEXT, args TEXT, sent INTEGER DEFAULT 0, PRIMARY KEY (agent, call_id));
     `);
+    if (!this.db.prepare("PRAGMA table_info(outbox)").all().some((c) => c.name === "done")) this.db.exec("ALTER TABLE outbox ADD COLUMN done INTEGER DEFAULT 0; UPDATE outbox SET done = 1"); // a store from before crash recovery: nothing in it counts as cut off
     let key = this.db.prepare("SELECT v FROM meta WHERE k = 'mac_key'").get()?.v;
     if (!key) { key = randomBytes(32).toString("hex"); this.db.prepare("INSERT INTO meta (k, v) VALUES ('mac_key', ?)").run(key); }
     this.key = Buffer.from(key, "hex");
@@ -63,6 +64,8 @@ export class Store {
       putOutbox: p("INSERT INTO outbox (agent, call_id, name, args) VALUES (?, ?, ?, ?)"),
       unsent: p("SELECT call_id, name, args FROM outbox WHERE agent = ? AND sent = 0 ORDER BY call_id"),
       markSent: p("UPDATE outbox SET sent = 1 WHERE agent = ? AND call_id = ?"),
+      markDone: p("UPDATE outbox SET done = 1 WHERE agent = ? AND call_id = ?"),
+      unanswered: p("SELECT call_id, name, args FROM outbox WHERE agent = ? AND sent = 1 AND done = 0 ORDER BY call_id"),
       sizes: p("SELECT (SELECT COALESCE(SUM(size),0) FROM checkpoints WHERE agent = ?) AS chain, (SELECT COALESCE(SUM(LENGTH(data)),0) FROM journal WHERE agent = ?) AS journal"),
       liveSizes: p("SELECT COALESCE(SUM(size),0) AS live FROM checkpoints WHERE agent = ? AND seq >= ?"),
       baseSize: p("SELECT size FROM checkpoints WHERE agent = ? AND seq = ?"),
@@ -155,6 +158,9 @@ export class Store {
   journal(id) { return this.q.journal.all(id).map((r) => ({ seq: r.seq, kind: r.kind, data: JSON.parse(r.data) })); }
   unsent(id) { return this.q.unsent.all(id).map((r) => ({ id: r.call_id, name: r.name, args: JSON.parse(r.args) })); }
   markSent(id, callId) { this.q.markSent.run(id, callId); }
+  markDone(id, callId) { this.q.markDone.run(id, callId); }
+  /** calls that went out and have no result: running here, or cut off by a crash */
+  unanswered(id) { return this.q.unanswered.all(id).map((r) => ({ id: r.call_id, name: r.name, args: JSON.parse(r.args) })); }
   metrics(id) { return this.q.metrics.all(id).map((r) => ({ seq: r.seq, kind: r.kind, size: r.size, ...JSON.parse(r.metrics) })); }
 
   sizes(id) {

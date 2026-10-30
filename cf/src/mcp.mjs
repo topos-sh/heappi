@@ -47,8 +47,8 @@ export function mcpClient(name, send) {
   };
   return {
     name, connect,
-    async call(tool, args) {
-      const once = () => rpc("tools/call", { name: tool, arguments: args ?? {} });
+    async call(tool, args, { key } = {}) {
+      const once = () => rpc("tools/call", { name: tool, arguments: args ?? {}, ...(key ? { _meta: { "heappi/idempotency-key": key } } : {}) });
       let r;
       try { r = await once(); } catch (e) { if (!/MCP 4\d\d/.test(e.message)) throw e; await connect(); r = await once(); } // a lost session: reconnect once
       const text = (r.content ?? []).map((c) => c.type === "text" ? c.text : `[${c.type}]`).join("\n");
@@ -71,18 +71,19 @@ export function connectMcp(servers) {
       const client = mcpClient(name, send);
       try {
         const tools = (await client.connect()).filter((t) => !spec.tools || spec.tools.includes(t.name));
-        for (const t of tools) catalog.push({ name: `mcp__${name}__${t.name}`, description: `[${name}] ${t.description ?? t.name}`.slice(0, 1000), inputSchema: t.inputSchema ?? { type: "object", properties: {} }, server: name, tool: t.name });
+        for (const t of tools) catalog.push({ name: `mcp__${name}__${t.name}`, description: `[${name}] ${t.description ?? t.name}`.slice(0, 1000), inputSchema: t.inputSchema ?? { type: "object", properties: {} }, server: name, tool: t.name, replay: t.annotations?.readOnlyHint || t.annotations?.idempotentHint ? "safe" : "unsafe" });
         clients.set(name, client);
         console.log(`mcp: ${name} connected, ${tools.length} tools`);
       } catch (e) { console.log(`mcp: ${name} failed: ${e.message}`); }
     }));
+    catalog.sort((a, b) => a.name.localeCompare(b.name)); // servers connect in any order; a stable list keeps the cached part of a prompt valid
     return {
       catalog,
       servers: [...clients.keys()],
-      async call(toolName, args) {
+      async call(toolName, args, options) {
         const entry = catalog.find((t) => t.name === toolName);
         if (!entry) throw new Error(`no MCP tool ${toolName}`);
-        return clients.get(entry.server).call(entry.tool, args);
+        return clients.get(entry.server).call(entry.tool, args, options);
       },
     };
   })();

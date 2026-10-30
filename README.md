@@ -75,7 +75,7 @@ Notes:
 | Path | What |
 |---|---|
 | `engine/shim.c`, `engine/heappi.wasm` | The host contract: init, eval, call, resume, snapshot, restore, apply, anchor, CPU budget, memory limit, script contexts. |
-| `embed/` | Pi Durable in the heap: `prelude.js`, `pi-glue.js`, `build.sh`, the Pi-versus-small benchmark, the restore benchmark. |
+| `embed/` | Pi Durable in the heap: `prelude.js`, `pi-glue.js`, `build.sh`, the Pi-versus-small benchmark, the restore benchmark, `pi-tests.mjs`. |
 | `host/` | The Node cell: `engine.mjs`, `store.mjs` (SQLite, layers, HMAC, journal, mailbox), `cell.mjs` (activation, folds, templates, rebuild check, upgrade), `tests.mjs`. |
 | `cf/` | The Cloudflare Worker: `src/cell.mjs` the cell as a Durable Object, `src/demo.mjs` the demo on it, `src/gateway.mjs`, `src/mcp.mjs`. |
 | `app/` | The Node chat environment: pi-ai gateway, MCP clients, signals, the page shared with the Cloudflare demo. |
@@ -94,11 +94,17 @@ Notes:
 
 **Code mode.** The `run` tool compiles the script in one of two script contexts inside the heap, with their own intrinsics. Only strings cross the boundary. `tools.<name>()` for every catalog tool including MCP and agent messaging, `remember()` and `mem[handle]` for working memory, `Promise.all` works, no nested scripts. A script awaiting a tool is parked with its frame. A script that never ends is terminated by the CPU budget after a grace period.
 
+**Crashes.** Every catalog tool says whether it may run twice (`replay: "safe"` or `"unsafe"`, Pi's own word; MCP tools take it from their `readOnlyHint` and `idempotentHint`). A call is marked as sent before it starts and done when it answers, so after a restart `Cell.recover` finds the calls that were cut off. A model call or a safe tool runs again under the same idempotency key, `<agent>:<call id>`, which reaches MCP servers as `_meta["heappi/idempotency-key"]`. Any other tool is never run again: the model gets an `interrupted` error and decides. The key is what makes `send_to_agent` safe, because the recipient drops a repeat. The heap needs no help with any of this, since a checkpoint and its outbox commit together. A tool that may not run twice also gets a tool round of its own (Pi's `executionMode: "sequential"`).
+
+**Steering and stop.** A message sent while the agent works becomes a `steer` event, Pi's `whenBusy: "steer"`, and joins the run after the current tool round. `cancel` aborts what the host has out, answers the heap's pending calls at once, calls Pi's `abort`, and leaves a note in the transcript so the next message does not answer the stopped request. An input may carry a `requestId`, Pi's own idempotency key: a repeat gets no second answer.
+
+**Tokens.** With more than eight catalog tools, MCP tools are `deferred` and the model finds them through Pi's `tool_search`; scripts can call them without loading. The catalog is sorted, so the start of a prompt stays the same across restarts and the provider's cache holds. In a three-message chat with 25 tools, the first request fell from 5,227 to 1,284 prompt tokens and the six requests together from 33,661 to 19,723.
+
 **The readable shadow.** Every event and call is journaled with bodies interned by hash, and every committed Pi entry is mirrored. At every fold the host rebuilds the agent from the layers plus the journal in a scratch heap and compares a canonical hash. A journal missing one event hashes differently.
 
 ## Interfaces
 
-**The heap contract.** The host knows six globals the harness defines, strings in and out: `__deliver(eventJson)`, `__drain()` returning the outbox as JSON, `__stats()`, `__stateHash()` for the rebuild check, `__migrate()` after a harness upgrade, `__peek(handle)` for debugging. Events in: `{type:"user", text}`, `{type:"signal", name, payload}`, `{type:"config", config}`, `{type:"result", id, value | error}`. Outbox out: `{kind:"call", id, name:"model"|"tool", args}`, `{kind:"reply", turn, text}`, `progress`, `pi.entry`, `error`. A call is answered by a result event with the same id in a later activation; the heap keeps the pending promise, the host keeps nothing. Any harness that implements this runs in the cell; Pi does through `embed/pi-glue.js`, the small harness natively.
+**The heap contract.** The host knows six globals the harness defines, strings in and out: `__deliver(eventJson)`, `__drain()` returning the outbox as JSON, `__stats()`, `__stateHash()` for the rebuild check, `__migrate()` after a harness upgrade, `__peek(handle)` for debugging. Events in: `{type:"user", text, requestId?}`, `{type:"steer", text, requestId?}`, `{type:"cancel"}`, `{type:"signal", name, payload}`, `{type:"config", config}`, `{type:"result", id, value | error}`. Outbox out: `{kind:"call", id, name:"model"|"tool", args}`, `{kind:"reply", turn, text, cancelled?}`, `progress` (tool starts and ends, `busy`, `steered`), `pi.entry`, `error`. A call is answered by a result event with the same id in a later activation; the heap keeps the pending promise, the host keeps nothing. Any harness that implements this runs in the cell; Pi does through `embed/pi-glue.js`, the small harness natively.
 
 **What a script sees.** Four names and nothing else: `tools.<name>(args)` for any catalog tool (`run` refused), `mem[handle]` and `remember(value, label)` for working memory, `log(...)`. Only strings cross the boundary; results come back as JSON copies.
 
@@ -107,17 +113,18 @@ Notes:
 | | |
 |---|---|
 | `GET/POST /api/agents` | list agents; create one `{id?, name?}` |
-| `POST /api/agents/:id/messages {text}` | a user turn |
-| `POST /api/agents/:id/signals {name, payload, afterMs?}` | an external signal, now or after a delay |
+| `POST /api/agents/:id/messages {text, requestId?, mode?}` | a user turn; `mode: "steer"` joins the running one |
+| `POST /api/agents/:id/cancel` | stop the running turn |
+| `POST /api/agents/:id/signals {name, payload, afterMs?, key?}` | an external signal, now or after a delay; on Cloudflare a repeated `key` is dropped |
 | `GET /api/agents/:id/events` | SSE: deltas, tool starts and ends, replies, activations |
 | `/api/agents/:id/transcript`, `info`, `evict`, `rename`, `DELETE` | read, inspect, drop the hot copy, rename, remove |
 | `POST /mcp/notes` | the notes MCP server, for outside clients |
 
-**Adding a tool:** on Node, a case in the broker in `app/server.mjs`; on Cloudflare, in `DemoCell.broker` in `cf/src/demo.mjs`, plus a catalog entry with a JSON schema. **Adding an MCP server:** a line in `app/mcp.json` (stdio or streamable HTTP) or in `mcpFor()` in `cf/src/demo.mjs` (`{url}` or `{handler}`). Tools reach the heap as `mcp__<server>__<tool>`.
+**Adding a tool:** on Node, a case in the broker in `app/server.mjs`; on Cloudflare, in `DemoCell.broker` in `cf/src/demo.mjs`, plus a catalog entry with a JSON schema and `replay: "safe"` if running it twice is harmless. **Adding an MCP server:** a line in `app/mcp.json` (stdio or streamable HTTP) or in `mcpFor()` in `cf/src/demo.mjs` (`{url}` or `{handler}`). Tools reach the heap as `mcp__<server>__<tool>`.
 
 ## Open problems
 
-The journal as Pi's storage adapter instead of a mirror, so there is one copy of the transcript. Releasing strings and atoms pinned in the anchor. One script context per script instead of a pool of two. WebSocket hibernation on the Cloudflare cell (SSE keeps the object alive while a page is open). Encryption at rest. Publishing the engine fork.
+The journal as Pi's storage adapter instead of a mirror, so there is one copy of the transcript. Scripts that run several unsafe tools with `Promise.all` are not kept apart. A Cloudflare object evicted mid-call recovers on the next message, signal or opened page, not by itself. Agents created before harness 102 keep their old harness and do not understand steer or cancel. Releasing strings and atoms pinned in the anchor. One script context per script instead of a pool of two. WebSocket hibernation on the Cloudflare cell (SSE keeps the object alive while a page is open). Encryption at rest. Publishing the engine fork.
 
 ## License
 

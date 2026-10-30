@@ -9,8 +9,9 @@
 //   GET  /api/agents           agents, model, tool catalog
 //   POST /api/agents {id?}     create an agent
 //   /api/agents/:id/events     SSE: deltas, tool starts and ends, replies, activations
-//   /api/agents/:id/messages   POST {text}
-//   /api/agents/:id/signals    POST {name, payload, afterMs}
+//   /api/agents/:id/messages   POST {text, requestId?, mode?: "input"|"steer"}
+//   /api/agents/:id/cancel     POST
+//   /api/agents/:id/signals    POST {name, payload, afterMs, key?}
 //   /api/agents/:id/transcript | info | evict | reset
 //   /mcp/notes                 the notes MCP server (streamable HTTP), same token
 import { DurableObject } from "cloudflare:workers";
@@ -27,10 +28,10 @@ const json = (o, status = 200, headers = {}) => new Response(JSON.stringify(o), 
 const enc = new TextEncoder();
 
 const BUILTIN_TOOLS = [
-  { name: "fetch", description: "Fetch a URL over HTTP and return its status and text (first 20 KB).", inputSchema: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } },
-  { name: "now", description: "Current date and time, ISO 8601.", inputSchema: { type: "object", properties: {} } },
-  { name: "list_agents", description: "The other agents running in this deployment, by name.", inputSchema: { type: "object", properties: {} } },
-  { name: "send_to_agent", description: "Send a message to another agent by name. It arrives in that agent's mailbox as [signal:from:<your name>] and it may answer you the same way.", inputSchema: { type: "object", properties: { agent: { type: "string", description: "the recipient's name" }, text: { type: "string" } }, required: ["agent", "text"] } },
+  { name: "fetch", description: "Fetch a URL over HTTP and return its status and text (first 20 KB).", inputSchema: { type: "object", properties: { url: { type: "string" } }, required: ["url"] }, replay: "safe" },
+  { name: "now", description: "Current date and time, ISO 8601.", inputSchema: { type: "object", properties: {} }, replay: "safe" },
+  { name: "list_agents", description: "The other agents running in this deployment, by name.", inputSchema: { type: "object", properties: {} }, replay: "safe" },
+  { name: "send_to_agent", description: "Send a message to another agent by name. It arrives in that agent's mailbox as [signal:from:<your name>] and it may answer you the same way.", inputSchema: { type: "object", properties: { agent: { type: "string", description: "the recipient's name" }, text: { type: "string" } }, required: ["agent", "text"] }, replay: "safe" }, // safe because the recipient drops a repeat of the same key
 ];
 const mcpFor = (env) => connectMcp({
   notes: { handler: notesServer(env.COLD) },
@@ -120,6 +121,7 @@ export class DemoCell extends CellBase {
     super(ctx, env, { harnessSrc: PI_HARNESS, prefix: "demo/agents" });
     this.subs = new Set(); // SSE writers
     this.running = null;
+    this.calls = new Map(); // call id → AbortController, for the calls this instance has out
     this.HOT_MAX_LINEAR = 48 * 1024 * 1024;
     this.FOLD_MIN = 256 * 1024; // Pi's checkpoints are larger than the small harness's; fold less often
   }
@@ -130,6 +132,7 @@ export class DemoCell extends CellBase {
       CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY, name TEXT, args TEXT, sent_at INTEGER, done INTEGER DEFAULT 0);
       CREATE TABLE IF NOT EXISTS alarms (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER, name TEXT, payload TEXT);
       CREATE TABLE IF NOT EXISTS completions (hash TEXT PRIMARY KEY, body TEXT);
+      CREATE TABLE IF NOT EXISTS seen_keys (key TEXT PRIMARY KEY);
     `);
   }
 
@@ -160,9 +163,11 @@ export class DemoCell extends CellBase {
       if (!this.exists()) return json({ error: "no such agent" }, 404);
       switch (op) {
         case "events": return this.events();
-        case "messages": { const { text } = await request.json(); if (typeof text !== "string" || !text.trim()) return json({ error: "text" }, 400); this.enqueue({ type: "user", text }, "ui"); this.ctx.waitUntil(this.run()); return json({ ok: true }); }
+        case "messages": { const { text, requestId, mode } = await request.json(); if (typeof text !== "string" || !text.trim()) return json({ error: "text" }, 400); this.enqueue({ type: mode === "steer" ? "steer" : "user", text, requestId }, "ui"); this.ctx.waitUntil(this.run()); return json({ ok: true }); }
+        case "cancel": { this.enqueue({ type: "cancel" }, "ui"); for (const c of this.calls.values()) c.abort(new Error("cancelled")); this.ctx.waitUntil(this.run()); return json({ ok: true }); }
         case "signals": {
-          const { name = "ping", payload = null, afterMs = 0 } = await request.json();
+          const { name = "ping", payload = null, afterMs = 0, key } = await request.json();
+          if (key) { if (this.sql.exec("SELECT 1 FROM seen_keys WHERE key = ?", key).toArray().length) return json({ ok: true, duplicate: true }); this.sql.exec("INSERT INTO seen_keys (key) VALUES (?)", key); }
           if (afterMs > 0) { this.sql.exec("INSERT INTO alarms (at, name, payload) VALUES (?, ?, ?)", Date.now() + afterMs, String(name), JSON.stringify(payload)); await this.scheduleAlarm(); return json({ ok: true, scheduled: true, at: Date.now() + afterMs }); }
           this.enqueue({ type: "signal", name: String(name), payload }, "signals"); this.ctx.waitUntil(this.run()); return json({ ok: true, scheduled: false });
         }
@@ -182,6 +187,7 @@ export class DemoCell extends CellBase {
     const { readable, writable } = new TransformStream();
     const w = writable.getWriter();
     this.subs.add(w);
+    this.ctx.waitUntil(this.run()); // an open page also picks up calls an eviction cut off
     const hello = { type: "hello", transcript: this.transcript(), stats: await this.stats() };
     w.write(enc.encode(`data: ${JSON.stringify(hello)}\n\n`)).catch(() => {});
     const ping = setInterval(() => { w.write(enc.encode(": ping\n\n")).catch(() => { clearInterval(ping); this.subs.delete(w); }); }, 15000);
@@ -212,7 +218,7 @@ export class DemoCell extends CellBase {
     return this.running;
   }
   async loop() {
-    this.redispatchStale();
+    this.recover();
     for (;;) {
       const events = this.pending();
       if (!events.length) return;
@@ -229,29 +235,31 @@ export class DemoCell extends CellBase {
       for (const c of calls) this.dispatch(c);
     }
   }
-  /** a call whose result never came back (the object was evicted mid-call) goes out again; the gateway cache makes a repeat cheap */
-  redispatchStale() {
-    for (const r of this.sql.exec("SELECT id, name, args FROM outbox WHERE done = 0 AND sent_at < ?", Date.now() - 90000).toArray()) {
-      this.sql.exec("UPDATE outbox SET sent_at = ? WHERE id = ?", Date.now(), r.id);
-      this.dispatch({ id: r.id, name: r.name, args: JSON.parse(r.args) });
+  /** a call no one here is waiting on was cut off by an eviction: a safe one goes out again under the same key, the model is told about any other */
+  recover() {
+    for (const r of this.sql.exec("SELECT id, name, args FROM outbox WHERE done = 0").toArray()) {
+      if (this.calls.has(r.id)) continue;
+      const args = JSON.parse(r.args);
+      if (r.name === "model" || args.replay === "safe") { this.dispatch({ id: r.id, name: r.name, args }); continue; }
+      this.enqueue({ type: "result", id: r.id, error: `interrupted: the host restarted while ${args.name ?? r.name} was running, so it may have partly happened. Check before trying it again.` }, "broker");
+      this.sql.exec("UPDATE outbox SET done = 1 WHERE id = ?", r.id);
     }
   }
   dispatch(call) {
-    const p = this.broker(call).then(
-      (value) => this.enqueue({ type: "result", id: call.id, value }, "broker"),
-      (err) => this.enqueue({ type: "result", id: call.id, error: String(err?.message ?? err) }, "broker"),
-    ).then(() => { this.sql.exec("UPDATE outbox SET done = 1 WHERE id = ?", call.id); return this.run(); });
-    this.ctx.waitUntil(p);
+    const controller = new AbortController();
+    this.calls.set(call.id, controller);
+    const answer = (result) => { this.calls.delete(call.id); this.enqueue({ type: "result", id: call.id, ...result }, "broker"); this.sql.exec("UPDATE outbox SET done = 1 WHERE id = ?", call.id); return this.run(); };
+    this.ctx.waitUntil(this.broker(call, { key: `${this.agentId}:${call.id}`, signal: controller.signal }).then((value) => answer({ value }), (err) => answer({ error: String(err?.message ?? err) })));
   }
 
   /** the broker: the model through the gateway (stored under the request hash first), the tools */
-  async broker(call) {
+  async broker(call, { key, signal }) {
     if (call.name === "model") {
-      const key = fnv(JSON.stringify(call.args));
-      const row = this.sql.exec("SELECT body FROM completions WHERE hash = ?", key).toArray()[0];
+      const hash = fnv(JSON.stringify(call.args));
+      const row = this.sql.exec("SELECT body FROM completions WHERE hash = ?", hash).toArray()[0];
       if (row) { this.publish({ type: "model_cached" }); return JSON.parse(row.body); }
-      const message = await getGateway(this.env).call(call.args, (ev) => this.publish(ev));
-      this.sql.exec("INSERT OR IGNORE INTO completions (hash, body) VALUES (?, ?)", key, JSON.stringify(message));
+      const message = await getGateway(this.env).call(call.args, (ev) => this.publish(ev), { signal, sessionId: this.agentId });
+      if (message?.stopReason !== "error" && message?.stopReason !== "aborted") this.sql.exec("INSERT OR IGNORE INTO completions (hash, body) VALUES (?, ?)", hash, JSON.stringify(message)); // a retry of a failed request asks again
       return message;
     }
     if (call.name === "tool") {
@@ -259,7 +267,7 @@ export class DemoCell extends CellBase {
       if (name === "fetch") {
         if (args?.source !== undefined && getGateway(this.env).modelId === "scripted") return fetchSource(Number(args.source)); // the scripted scenario's sources
         if (typeof args?.url !== "string" || !/^https?:\/\//.test(args.url)) throw new Error("fetch needs { url }");
-        const r = await fetch(args.url, { signal: AbortSignal.timeout(20000), headers: { "user-agent": "heappi-demo" } });
+        const r = await fetch(args.url, { signal: AbortSignal.any([AbortSignal.timeout(20000), signal]), headers: { "user-agent": "heappi-demo" } });
         return { status: r.status, text: (await r.text()).slice(0, 20000) };
       }
       if (name === "now") return new Date().toISOString();
@@ -270,11 +278,11 @@ export class DemoCell extends CellBase {
         if (!to) throw new Error(`no agent called ${args?.agent}; list_agents gives the names`);
         if (to.id === this.agentId) throw new Error("that is you");
         const me = await index.nameOf(this.agentId);
-        const r = await this.env.CELL.get(this.env.CELL.idFromName(to.id)).fetch(new Request(`http://cell/api/agents/${to.id}/signals`, { method: "POST", body: JSON.stringify({ name: `from:${me}`, payload: String(args?.text ?? "") }) }));
+        const r = await this.env.CELL.get(this.env.CELL.idFromName(to.id)).fetch(new Request(`http://cell/api/agents/${to.id}/signals`, { method: "POST", body: JSON.stringify({ name: `from:${me}`, payload: String(args?.text ?? ""), key }) }));
         if (!r.ok) throw new Error(`delivery to ${to.name} failed: ${(await r.text()).slice(0, 200)}`);
         return `delivered to ${to.name}`;
       }
-      if (name.startsWith("mcp__")) return (await mcpFor(this.env)).call(name, args);
+      if (name.startsWith("mcp__")) return (await mcpFor(this.env)).call(name, args, { key });
       throw new Error("unknown tool " + name);
     }
     throw new Error("unknown call " + call.name);

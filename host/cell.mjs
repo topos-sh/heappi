@@ -5,7 +5,9 @@
 // Also here: the layers (engine, harness) shared by all agents, the fold
 // (by bytes, or when the last restore was slow), the rebuild from the
 // journal with the hash check at every fold, the harness upgrade in place,
-// and the hot-tier eviction when the wasm memory bloats.
+// the hot-tier eviction when the wasm memory bloats, and what happens to a
+// call a crash cut off: rerun under the same key if it is safe, reported to
+// the model if it is not.
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { NodeEngine as Engine, SNAPSHOT_BASE, SNAPSHOT_CHAIN, SNAPSHOT_FOLD } from "./engine-node.mjs";
@@ -15,7 +17,7 @@ export const HARNESS_PATH = fileURLToPath(new URL("../heap/harness.js", import.m
 export class Cell {
   /**
    * @param store Store
-   * @param broker { call(agentId, id, name, args) → Promise<value>, settle?() }
+   * @param broker { call(agentId, id, name, args, { key, signal }) → Promise<value>, settle?() }
    * @param opts { foldEvery, foldMinBytes, foldMaxApplyMs, hotMaxLinear, memoryLimit, harnessSrc, checkRebuild }
    */
   constructor(store, broker, opts = {}) {
@@ -35,6 +37,7 @@ export class Cell {
     this.useTemplates = opts.useTemplates ?? true;
     this.metrics = [];
     this.rebuilds = [];
+    this.calls = new Map(); // `${agentId}:${id}` → AbortController, for the calls this process has out
   }
 
   // ---- layers: engine (natives only) and harness, built once, stored once ----
@@ -177,17 +180,44 @@ export class Cell {
     this.store.commit(agentId, epoch, { checkpoint: { kind, bytes, metrics }, journal, outbox, processed: events.map((e) => e.seq) });
     const commitMs = performance.now() - tCommit;
 
-    for (const o of this.store.unsent(agentId)) {
-      this.broker.call(agentId, o.id, o.name, o.args)
-        .then((value) => this.store.enqueue(agentId, { type: "result", id: o.id, value }, { sender: "broker" }),
-              (err) => this.store.enqueue(agentId, { type: "result", id: o.id, error: String(err?.message ?? err) }, { sender: "broker" }));
-      this.store.markSent(agentId, o.id);
-    }
+    for (const o of this.store.unsent(agentId)) this.#dispatch(agentId, o);
     if (engine.linearBytes > this.hotMaxLinear) this.evictHot(agentId); // bloat: the next activation restores warm
 
     const rec = { agentId, events: events.length, tier: loaded.tier, how: loaded.how, restoreMs: loaded.restoreMs, readMs: loaded.readMs, instantiateMs: loaded.instantiateMs, applyMs: loaded.applyMs, chainLength: loaded.chainLength, chainBytes: loaded.chainBytes, runMs, kind, checkpointBytes: bytes.length, snapshotMs, commitMs, calls: outbox.length, replies, heapUsed: mem.memory_used, objects: mem.obj_count, linearBytes: engine.linearBytes, rebuild, evicted: !this.hot.has(agentId) };
     this.metrics.push(rec);
     return rec;
+  }
+
+  /** marked as sent before it starts: after a crash, "sent" means it may have started. The key stays the same if it runs again. */
+  #dispatch(agentId, o) {
+    const key = `${agentId}:${o.id}`;
+    const controller = new AbortController();
+    this.calls.set(key, controller);
+    this.store.markSent(agentId, o.id);
+    const answer = (result) => { this.calls.delete(key); this.store.enqueue(agentId, { type: "result", id: o.id, ...result }, { sender: "broker" }); this.store.markDone(agentId, o.id); };
+    this.broker.call(agentId, o.id, o.name, o.args, { key, signal: controller.signal })
+      .then((value) => answer({ value }), (err) => answer({ error: String(err?.message ?? err) }));
+  }
+
+  /** stop what this agent has out; each call answers with an error as it stops */
+  abortCalls(agentId) { for (const [key, c] of this.calls) if (key.startsWith(agentId + ":")) c.abort(new Error("cancelled")); }
+
+  /**
+   * After a restart: calls that went out and never answered. A model call or
+   * a tool marked safe runs again under the same key. Any other tool may have
+   * partly happened, so the model is told and decides.
+   */
+  recover(agentId) {
+    const r = { rerun: [], interrupted: [] };
+    for (const o of this.store.unsent(agentId)) this.#dispatch(agentId, o); // committed, never started
+    for (const o of this.store.unanswered(agentId)) {
+      if (this.calls.has(`${agentId}:${o.id}`)) continue;
+      if (o.name === "model" || o.args?.replay === "safe") { this.#dispatch(agentId, o); r.rerun.push(o.id); continue; }
+      this.store.enqueue(agentId, { type: "result", id: o.id, error: `interrupted: the host restarted while ${o.args?.name ?? o.name} was running, so it may have partly happened. Check before trying it again.` }, { sender: "broker" });
+      this.store.markDone(agentId, o.id);
+      r.interrupted.push(o.id);
+    }
+    return r;
   }
 
   /**

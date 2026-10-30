@@ -10,7 +10,7 @@
     "smoke": "node --no-warnings host/smoke.mjs",
     "demo": "node --no-warnings host/demo.mjs 3",
     "bench": "node --no-warnings bench/run.mjs",
-    "test": "node --no-warnings host/tests.mjs",
+    "test": "npm run -s build:harness && node --no-warnings host/tests.mjs && node --no-warnings embed/pi-tests.mjs",
     "cf:sync": "./cf/sync.sh",
     "build:harness": "./embed/build.sh",
     "app": "npm run -s build:harness && node --no-warnings app/server.mjs",

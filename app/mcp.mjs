@@ -21,19 +21,20 @@ export async function connectMcp(configPath) {
         : new StdioClientTransport({ command: spec.command, args: (spec.args ?? []).map(abs), env: { ...process.env, ...Object.fromEntries(Object.entries(spec.env ?? {}).map(([k, v]) => [k, abs(v)])) }, stderr: "pipe" });
       await client.connect(transport);
       const { tools } = await client.listTools();
-      for (const t of tools) catalog.push({ name: `mcp__${name}__${t.name}`, description: `[${name}] ${t.description ?? t.name}`, inputSchema: t.inputSchema ?? { type: "object", properties: {} }, server: name, tool: t.name });
+      for (const t of tools) catalog.push({ name: `mcp__${name}__${t.name}`, description: `[${name}] ${t.description ?? t.name}`, inputSchema: t.inputSchema ?? { type: "object", properties: {} }, server: name, tool: t.name, replay: t.annotations?.readOnlyHint || t.annotations?.idempotentHint ? "safe" : "unsafe" });
       clients.set(name, client);
       console.log(`mcp: ${name} connected, ${tools.length} tools`);
     } catch (e) {
       console.log(`mcp: ${name} failed: ${e.message}`);
     }
   }
+  catalog.sort((a, b) => a.name.localeCompare(b.name)); // the same order every start, so the cached part of a prompt stays valid
   return {
     catalog,
-    async call(toolName, args) {
+    async call(toolName, args, { key, signal } = {}) {
       const entry = catalog.find((t) => t.name === toolName);
       if (!entry) throw new Error(`no MCP tool ${toolName}`);
-      const r = await clients.get(entry.server).callTool({ name: entry.tool, arguments: args ?? {} });
+      const r = await clients.get(entry.server).callTool({ name: entry.tool, arguments: args ?? {}, ...(key ? { _meta: { "heappi/idempotency-key": key } } : {}) }, undefined, { signal });
       const text = (r.content ?? []).map((c) => c.type === "text" ? c.text : `[${c.type}]`).join("\n");
       if (r.isError) throw new Error(text || "tool error");
       if (r.structuredContent) return r.structuredContent;

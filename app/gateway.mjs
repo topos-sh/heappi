@@ -22,7 +22,7 @@ export function createGateway({ provider = "anthropic", modelId = process.env.HE
     subscribe(agentId, fn) { (subscribers.get(agentId) ?? subscribers.set(agentId, new Set()).get(agentId)).add(fn); return () => subscribers.get(agentId)?.delete(fn); },
     emit,
     /** request = { context: { systemPrompt, messages, tools }, options } from the heap */
-    async call(agentId, request) {
+    async call(agentId, request, { signal } = {}) {
       const key = createHash("sha256").update(JSON.stringify(request)).digest("base64url");
       if (completions.has(key)) { emit(agentId, { type: "model_cached" }); return completions.get(key); }
       let message;
@@ -30,7 +30,7 @@ export function createGateway({ provider = "anthropic", modelId = process.env.HE
         message = simpleToAssistant(scriptedModel({ messages: transcriptToSimple(request.context.messages), tools: [] }));
         for (const c of message.content) if (c.type === "text") emit(agentId, { type: "text_delta", delta: c.text });
       } else {
-        const stream = models.stream(model, request.context, { maxTokens: request.options?.maxTokens ?? 4096, signal: undefined });
+        const stream = models.stream(model, request.context, { maxTokens: request.options?.maxTokens ?? 4096, signal, sessionId: agentId });
         emit(agentId, { type: "model_start", model: modelId });
         for await (const ev of stream) {
           if (ev.type === "text_delta") emit(agentId, { type: "text_delta", delta: ev.delta });
@@ -39,7 +39,7 @@ export function createGateway({ provider = "anthropic", modelId = process.env.HE
         }
         message ??= await stream.result?.();
       }
-      completions.set(key, message);
+      if (message?.stopReason !== "error" && message?.stopReason !== "aborted") completions.set(key, message); // a retry of a failed request asks again
       emit(agentId, { type: "model_done", stopReason: message?.stopReason, usage: message?.usage });
       return message;
     },
